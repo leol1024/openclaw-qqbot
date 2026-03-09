@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import path from "node:path";
 import * as fs from "node:fs";
 import type { ResolvedQQBotAccount, WSPayload, C2CMessageEvent, GuildMessageEvent, GroupMessageEvent } from "./types.js";
-import { getAccessToken, getGatewayUrl, sendC2CMessage, sendChannelMessage, sendGroupMessage, clearTokenCache, sendC2CImageMessage, sendGroupImageMessage, sendC2CVoiceMessage, sendGroupVoiceMessage, sendC2CVideoMessage, sendGroupVideoMessage, sendC2CFileMessage, sendGroupFileMessage, initApiConfig, startBackgroundTokenRefresh, stopBackgroundTokenRefresh, sendC2CInputNotify } from "./api.js";
+import { getAccessToken, getGatewayUrl, sendC2CMessage, sendChannelMessage, sendDmMessage, sendGroupMessage, clearTokenCache, sendC2CImageMessage, sendGroupImageMessage, sendC2CVoiceMessage, sendGroupVoiceMessage, sendC2CVideoMessage, sendGroupVideoMessage, sendC2CFileMessage, sendGroupFileMessage, initApiConfig, startBackgroundTokenRefresh, stopBackgroundTokenRefresh, sendC2CInputNotify } from "./api.js";
 import { loadSession, saveSession, clearSession, type SessionState } from "./session-store.js";
 import { recordKnownUser, flushKnownUsers } from "./known-users.js";
 import { getQQBotRuntime } from "./runtime.js";
@@ -605,32 +605,38 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           direction: "inbound",
         });
 
-        // 发送输入状态提示（非关键，失败不影响主流程）
-        try {
-          let token = await getAccessToken(account.appId, account.clientSecret);
+        // 发送输入状态提示（仅 C2C 私聊，频道/频道私信/群聊不支持）
+        if (event.type !== "guild" && event.type !== "group" && event.type !== "dm") {
           try {
-            await sendC2CInputNotify(token, event.senderId, event.messageId, 60);
-          } catch (notifyErr) {
-            const errMsg = String(notifyErr);
-            if (errMsg.includes("token") || errMsg.includes("401") || errMsg.includes("11244")) {
-              log?.info(`[qqbot:${account.accountId}] InputNotify token expired, refreshing...`);
-              clearTokenCache(account.appId);
-              token = await getAccessToken(account.appId, account.clientSecret);
+            let token = await getAccessToken(account.appId, account.clientSecret);
+            try {
               await sendC2CInputNotify(token, event.senderId, event.messageId, 60);
-            } else {
-              throw notifyErr;
+            } catch (notifyErr) {
+              const errMsg = String(notifyErr);
+              if (errMsg.includes("token") || errMsg.includes("401") || errMsg.includes("11244")) {
+                log?.info(`[qqbot:${account.accountId}] InputNotify token expired, refreshing...`);
+                clearTokenCache(account.appId);
+                token = await getAccessToken(account.appId, account.clientSecret);
+                await sendC2CInputNotify(token, event.senderId, event.messageId, 60);
+              } else {
+                throw notifyErr;
+              }
             }
+            log?.info(`[qqbot:${account.accountId}] Sent input notify to ${event.senderId}`);
+          } catch (err) {
+            log?.error(`[qqbot:${account.accountId}] sendC2CInputNotify error: ${err}`);
           }
-          log?.info(`[qqbot:${account.accountId}] Sent input notify to ${event.senderId}`);
-        } catch (err) {
-          log?.error(`[qqbot:${account.accountId}] sendC2CInputNotify error: ${err}`);
         }
 
         const isGroupChat = event.type === MSG_TYPE_GUILD || event.type === MSG_TYPE_GROUP;
         // peerId 只放纯 ID，类型信息由 peer.kind 表达
+        // 频道：用 channelId
+        // 频道私信：用 channelId（隔离到频道维度）
         // 群聊：用 groupOpenid（框架根据 kind:"group" 区分）
-        // 私聊：用 senderId（框架根据 dmScope 决定隔离粒度）
+        // 频道私信：用 channelId（隔离到频道维度）
+        // C2C 私聊：用 senderId（框架根据 dmScope 决定隔离粒度）
         const peerId = event.type === MSG_TYPE_GUILD ? (event.channelId ?? "unknown")
+                     : event.type === MSG_TYPE_DM ? (event.channelId ?? event.senderId)
                      : event.type === MSG_TYPE_GROUP ? (event.groupOpenid ?? "unknown")
                      : event.senderId;
 
@@ -878,8 +884,11 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           receivedMediaSection = `\n${mediaSections.join("\n")}`;
         }
 
-        // AI 看到的投递地址必须带完整前缀（qqbot:c2c: / qqbot:group:）
-        const qualifiedTarget = isGroupChat ? `qqbot:group:${event.groupOpenid}` : `qqbot:c2c:${event.senderId}`;
+        // AI 看到的投递地址必须带完整前缀（qqbot:c2c: / qqbot:group: / qqbot:dm:）
+        const qualifiedTarget = event.type === "guild" ? `qqbot:channel:${event.channelId}`
+                              : event.type === "dm" ? `qqbot:dm:${event.guildId}`
+                              : event.type === "group" ? `qqbot:group:${event.groupOpenid}`
+                              : `qqbot:c2c:${event.senderId}`;
 
         // 动态检测 TTS/STT 配置状态
         const hasTTS = !!resolveTTSConfig(cfg as Record<string, unknown>);
@@ -918,7 +927,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
 【会话上下文】
 - 用户: ${event.senderName || "未知"} (${event.senderId})
-- 场景: ${isGroupChat ? "群聊" : "私聊"}${isGroupChat ? ` (群组: ${event.groupOpenid})` : ""}
+- 场景: ${event.type === "guild" ? "频道" : event.type === "dm" ? "频道私信" : isGroupChat ? "群聊" : "私聊"}${event.type === "guild" ? ` (频道: ${event.channelId}, 服务器: ${event.guildId})` : event.type === "dm" ? ` (频道: ${event.channelId}, 服务器: ${event.guildId})` : isGroupChat ? ` (群组: ${event.groupOpenid})` : ""}
 - 消息ID: ${event.messageId}
 - 投递目标: ${qualifiedTarget}${receivedMediaSection}${voiceAsrSection}
 - 当前时间戳(ms): ${nowMs}
@@ -959,6 +968,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
         const fromAddress = event.type === MSG_TYPE_GUILD ? `qqbot:channel:${event.channelId}`
                          : event.type === MSG_TYPE_GROUP ? `qqbot:group:${event.groupOpenid}`
+                         : event.type === MSG_TYPE_DM ? `qqbot:dm:${event.guildId}:${event.senderId}`
                          : `qqbot:c2c:${event.senderId}`;
         const toAddress = fromAddress;
 
@@ -1055,6 +1065,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                 await sendC2CMessage(token, event.senderId, errorText, event.messageId);
               } else if (event.type === MSG_TYPE_GROUP && event.groupOpenid) {
                 await sendGroupMessage(token, event.groupOpenid, errorText, event.messageId);
+              } else if (event.type === "dm" && event.guildId) {
+                await sendDmMessage(token, event.guildId, errorText, event.messageId);
               } else if (event.channelId) {
                 await sendChannelMessage(token, event.channelId, errorText, event.messageId);
               }
@@ -1066,26 +1078,37 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
         // ============ 通用消息发送辅助函数（消除三路分派重复） ============
         
-        /** 发送文本消息（自动根据 event.type 分派到 c2c/group/channel） */
+        /** 发送文本消息（自动根据 event.type 分派到 c2c/group/dm/channel） */
         const sendTextMessage = async (text: string) => {
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CMessage(token, event.senderId, text, event.messageId);
             } else if (event.type === MSG_TYPE_GROUP && event.groupOpenid) {
               await sendGroupMessage(token, event.groupOpenid, text, event.messageId);
+            } else if (event.type === MSG_TYPE_DM && event.guildId) {
+              await sendDmMessage(token, event.guildId, text, event.messageId);
             } else if (event.channelId) {
               await sendChannelMessage(token, event.channelId, text, event.messageId);
             }
           });
         };
 
-        /** 发送图片消息（URL 或 Base64 DataURL，自动三路分派） */
+        /** 发送图片消息（URL 或 Base64 DataURL，自动四路分派） */
         const sendImageMessage = async (imageUrl: string, altMarkdown?: string) => {
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CImageMessage(token, event.senderId, imageUrl, event.messageId);
             } else if (event.type === MSG_TYPE_GROUP && event.groupOpenid) {
               await sendGroupImageMessage(token, event.groupOpenid, imageUrl, event.messageId);
+            } else if (event.type === MSG_TYPE_DM && event.guildId) {
+              // 频道私信：公网 URL 使用 Markdown 格式，本地图片暂不支持
+              if (altMarkdown) {
+                await sendDmMessage(token, event.guildId, altMarkdown, event.messageId);
+              } else if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) {
+                await sendDmMessage(token, event.guildId, `![](${imageUrl})`, event.messageId);
+              } else {
+                log?.info(`[qqbot:${account.accountId}] DM does not support rich media for local images`);
+              }
             } else if (event.channelId) {
               // 频道不支持富媒体 API，降级到文本/markdown
               if (altMarkdown) {
@@ -1099,39 +1122,45 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           });
         };
 
-        /** 发送语音消息（自动三路分派） */
+        /** 发送语音消息（自动四路分派） */
         const sendVoiceMessage = async (silkBase64: string) => {
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId);
             } else if (event.type === MSG_TYPE_GROUP && event.groupOpenid) {
               await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
+            } else if (event.type === MSG_TYPE_DM && event.guildId) {
+              await sendDmMessage(token, event.guildId, `[语音消息暂不支持频道私信发送]`, event.messageId);
             } else if (event.channelId) {
               await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送]`, event.messageId);
             }
           });
         };
 
-        /** 发送视频消息（URL 或 Base64，自动三路分派） */
+        /** 发送视频消息（URL 或 Base64，自动四路分派） */
         const sendVideoMessage = async (url?: string, base64?: string) => {
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CVideoMessage(token, event.senderId, url, base64, event.messageId);
             } else if (event.type === MSG_TYPE_GROUP && event.groupOpenid) {
               await sendGroupVideoMessage(token, event.groupOpenid, url, base64, event.messageId);
+            } else if (event.type === MSG_TYPE_DM && event.guildId) {
+              await sendDmMessage(token, event.guildId, `[视频消息暂不支持频道私信发送]`, event.messageId);
             } else if (event.channelId) {
               await sendChannelMessage(token, event.channelId, `[视频消息暂不支持频道发送]`, event.messageId);
             }
           });
         };
 
-        /** 发送文件消息（URL 或 Base64，自动三路分派） */
+        /** 发送文件消息（URL 或 Base64，自动四路分派） */
         const sendFileMessage = async (base64?: string, url?: string, fileName?: string) => {
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CFileMessage(token, event.senderId, base64, url, event.messageId, fileName);
             } else if (event.type === MSG_TYPE_GROUP && event.groupOpenid) {
               await sendGroupFileMessage(token, event.groupOpenid, base64, url, event.messageId, fileName);
+            } else if (event.type === MSG_TYPE_DM && event.guildId) {
+              await sendDmMessage(token, event.guildId, `[文件消息暂不支持频道私信发送]`, event.messageId);
             } else if (event.channelId) {
               await sendChannelMessage(token, event.channelId, `[文件消息暂不支持频道发送]`, event.messageId);
             }
@@ -1270,6 +1299,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           // 确定发送目标
           const targetTo = event.type === MSG_TYPE_C2C ? event.senderId
                         : event.type === MSG_TYPE_GROUP ? `group:${event.groupOpenid}`
+                        : event.type === MSG_TYPE_DM ? `dm:${event.guildId}`
                         : `channel:${event.channelId}`;
 
           // ============ 流式消息发送器（仅 C2C 私聊 + streamSupport 开启） ============
@@ -2516,6 +2546,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   content: event.content,
                   messageId: event.id,
                   timestamp: event.timestamp,
+                  channelId: event.channel_id,
                   guildId: event.guild_id,
                   attachments: event.attachments,
                 });
