@@ -213,10 +213,47 @@ describe("findMediaTagSafePoint", () => {
     expect(findMediaTagSafePoint("Hello world")).toBe(11);
   });
 
-  it("完整标签对返回全长", () => {
+  // ---- 完整标签阻止截断（留给 processBuffer 处理） ----
+
+  it("完整标签应返回标签前位置（阻止截断发送）", () => {
     const text = "前缀<qqimg>/path/file.png</qqimg>后缀";
-    expect(findMediaTagSafePoint(text)).toBe(text.length);
+    const safePoint = findMediaTagSafePoint(text);
+    // 完整标签必须留在 buffer 中等 processBuffer 处理，安全点在标签 '<' 之前
+    expect(safePoint).toBe("前缀".length);
   });
+
+  it("完整 qqvideo 标签 + 公网 URL 应阻止截断", () => {
+    const text = "<qqvideo>https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4</qqvideo>\n\n";
+    const safePoint = findMediaTagSafePoint(text);
+    expect(safePoint).toBe(0); // 标签从头开始，安全点在 0
+  });
+
+  it("文字后跟完整标签应在文字后截断", () => {
+    const text = "这是一段文字\n\n<qqvideo>https://example.com/video.mp4</qqvideo>";
+    const safePoint = findMediaTagSafePoint(text);
+    expect(safePoint).toBe("这是一段文字\n\n".length);
+  });
+
+  it("完整图片标签 + 公网 URL 应阻止截断", () => {
+    const text = "看这张图：<qqimg>https://example.com/photo.jpg</qqimg>";
+    const safePoint = findMediaTagSafePoint(text);
+    expect(safePoint).toBe("看这张图：".length);
+  });
+
+  it("多个完整标签应在第一个标签前截断", () => {
+    const text = "文字<qqimg>/a.png</qqimg>中间<qqvoice>/b.wav</qqvoice>结尾";
+    const safePoint = findMediaTagSafePoint(text);
+    // 应在第一个标签 '<qqimg>' 之前截断
+    expect(safePoint).toBe("文字".length);
+  });
+
+  it("只有完整标签（无前缀文字）返回 0", () => {
+    const text = "<qqimg>/path/file.png</qqimg>";
+    const safePoint = findMediaTagSafePoint(text);
+    expect(safePoint).toBe(0);
+  });
+
+  // ---- 不完整标签安全截断 ----
 
   it("不完整的开始标签 '<qq' 应在 '<' 之前截断", () => {
     const text = "Hello world<qq";
@@ -269,15 +306,12 @@ describe("findMediaTagSafePoint", () => {
     expect(safePoint).toBeLessThan(text.length);
   });
 
-  it("多个完整标签后跟不完整标签应正确截断", () => {
+  it("完整标签后跟不完整标签应在完整标签前截断", () => {
+    // 由于完整标签也需要被阻止截断，安全点应在第一个完整标签前
     const text = "已完成<qqimg>/a.png</qqimg>未完成<qqim";
     const safePoint = findMediaTagSafePoint(text);
-    // 最后一个 '<' 是 '<qqim'，被识别为不完整标签名，在其前面截断
-    const safe = text.slice(0, safePoint);
-    expect(safe).not.toContain("<qqim>");  // 不完整的标签不应出现在安全文本中
-    // 完整的标签应该被保留
-    expect(safe).toContain("<qqimg>/a.png</qqimg>");
-    expect(safe).toContain("未完成");
+    // 第一个完整标签 <qqimg> 前就应该截断
+    expect(safePoint).toBe("已完成".length);
   });
 
   it("不完整的 qqvoice 标签应正确截断", () => {
@@ -301,6 +335,20 @@ describe("findMediaTagSafePoint", () => {
   it("无 '<' 的长文本返回全长", () => {
     const text = "A".repeat(5000);
     expect(findMediaTagSafePoint(text)).toBe(5000);
+  });
+
+  // ---- 非媒体标签的尖括号不受影响 ----
+
+  it("非媒体标签的 HTML（如 <b>）不影响安全点", () => {
+    const text = "Hello <b>world</b> foo";
+    const safePoint = findMediaTagSafePoint(text);
+    expect(safePoint).toBe(text.length);
+  });
+
+  it("普通 XML 标签不影响安全点", () => {
+    const text = "看看这个 <code>console.log</code> 的输出";
+    const safePoint = findMediaTagSafePoint(text);
+    expect(safePoint).toBe(text.length);
   });
 });
 

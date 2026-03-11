@@ -294,26 +294,44 @@ export function parseMediaTags(
 // ============ 流式攒包：媒体标签完整性检测 ============
 
 /**
- * 检测文本末尾是否存在不完整的媒体标签
+ * 检测文本中是否存在媒体标签（完整或不完整），返回安全截断点
  *
- * 流式场景下，AI 输出的 <qqimg>path</qqimg> 标签可能被截断在：
- *   1. 开始标签中间：  "<qq" / "<qqim" / "<qqimg" / "<qqimg>"
- *   2. 标签内容中间：  "<qqimg>/path/to/fi"
- *   3. 结束标签中间：  "<qqimg>/path</qq" / "<qqimg>/path</"
+ * 流式场景下，媒体标签需要由 processBuffer（MediaTagHandler）来处理，
+ * 不能被 findSafeFlushPoint 截断后当作纯文本发送出去。
  *
- * 如果在这些位置截断发送，QQ API 会收到含有不完整标签的文本，
- * 后续拼接时会格式错乱。
+ * 因此本函数对两种情况都要阻止截断：
+ *
+ * A. 完整标签 <qqXXX>path</qqXXX>
+ *    - 必须留在 buffer 中等待 processBuffer → MediaTagHandler.handle 拦截处理
+ *    - 返回完整标签第一个 '<' 之前的位置
+ *
+ * B. 不完整标签（被截断在各种位置）
+ *    - 开始标签中间：  "<qq" / "<qqim" / "<qqimg" / "<qqimg>"
+ *    - 标签内容中间：  "<qqimg>/path/to/fi"
+ *    - 结束标签中间：  "<qqimg>/path</qq" / "<qqimg>/path</"
+ *    - 返回不完整标签的 '<' 之前的位置
  *
  * @param text 待检测的文本
  * @returns 安全截断位置（从该位置截断发送，之后的内容留在缓冲区）
- *          返回 text.length 表示全部安全
+ *          返回 text.length 表示全部安全（无任何媒体标签）
  */
 export function findMediaTagSafePoint(text: string): number {
   const len = text.length;
   if (len === 0) return 0;
 
-  // 策略：从文本末尾向前搜索，找到最后一个 '<' 字符，
-  // 判断它是否是一个不完整的媒体标签的开始
+  // ---- 第一阶段：扫描所有完整的媒体标签 ----
+  // 完整标签必须留在 buffer 中等 processBuffer 处理，不能被截断发送
+  const completeRegex = new RegExp(MEDIA_TAG_REGEX.source, MEDIA_TAG_REGEX.flags);
+  const completeMatches = [...text.matchAll(completeRegex)];
+
+  if (completeMatches.length > 0) {
+    // 找到第一个完整标签，安全点在它之前
+    const firstMatch = completeMatches[0]!;
+    return firstMatch.index!;
+  }
+
+  // ---- 第二阶段：检测不完整的媒体标签 ----
+  // 没有完整标签，但可能有正在形成中的不完整标签
 
   // 最大回溯范围（媒体标签最长不会超过这个长度）
   // <qqvideo>很长的路径最多2048字符</qqvideo> ≈ 2080
@@ -337,14 +355,7 @@ export function findMediaTagSafePoint(text: string): number {
   // 从 lastAngleBracket 开始到末尾的文本
   const tail = text.slice(lastAngleBracket);
 
-  // 检查 1: 完整的标签对（已闭合）
-  // 如果末尾有完整的 <qqXXX>...</qqXXX>，那就是安全的
-  const completeTagRegex = /^<(qqimg|qqvoice|qqvideo|qqfile)>[^<>]+<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>$/i;
-  if (completeTagRegex.test(tail)) {
-    return len; // 完整标签，全部安全
-  }
-
-  // 检查 2: 是否是不完整的开始标签或闭合标签
+  // 检查 1: 是否是不完整的开始标签或闭合标签
   // 匹配 "<", "<q", "<qq", "<qqi", "<qqim", "<qqimg", "<qqimg>",
   // "<qqv", "<qqvo", "<qqvoi", "<qqvoic", "<qqvoice", "<qqvoice>",
   // 等等，以及 "</", "</q", "</qq"...
@@ -367,7 +378,7 @@ export function findMediaTagSafePoint(text: string): number {
     return lastAngleBracket;
   }
 
-  // 检查 3: 有完整的开始标签 <qqXXX> 但没有闭合
+  // 检查 2: 有完整的开始标签 <qqXXX> 但没有闭合
   // e.g. "<qqimg>/path/to/file" 或 "<qqimg>/path</qq"
   const hasOpenTag = /^<(qqimg|qqvoice|qqvideo|qqfile)>/i.test(tail);
   if (hasOpenTag) {
@@ -379,7 +390,7 @@ export function findMediaTagSafePoint(text: string): number {
     }
   }
 
-  // 检查 4: 闭合标签中间被截断
+  // 检查 3: 闭合标签中间被截断
   // e.g. "some text</qq" 或 "text</" 
   const incompleteCloseInText = /<\/(?:q(?:q(?:i(?:m(?:g)?)?|v(?:o(?:i(?:c(?:e)?)?)?|i(?:d(?:e(?:o)?)?)?)?|f(?:i(?:l(?:e)?)?)?)?)?)?$/i;
   if (incompleteCloseInText.test(tail)) {
@@ -397,7 +408,7 @@ export function findMediaTagSafePoint(text: string): number {
     return lastAngleBracket;
   }
 
-  // 全部安全
+  // 全部安全（没有任何媒体标签相关内容）
   return len;
 }
 

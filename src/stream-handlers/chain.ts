@@ -3,7 +3,8 @@
  *
  * 管理多个 StreamHandler，按注册顺序串联，提供两个核心方法：
  * - processBuffer：遍历 handler 的 canHandle → handle（主动处理）
- * - findSafeFlushPoint：遍历 handler 的 findSafePoint，取最小安全点（被动阻断）
+ * - findSafeFlushPoint：管道模式，第一个 handler 算出截断上界，
+ *   后续 handler 在上界范围内逐步收紧（被动阻断）
  */
 
 import type { StreamHandler, StreamHandlerContext, HandleResult } from "./types.js";
@@ -51,25 +52,37 @@ export class StreamHandlerChain {
   }
 
   /**
-   * 被动阻断：计算 buffer 的安全截断点
+   * 被动阻断：计算 buffer 的安全截断点（管道模式）
    *
-   * 遍历所有 handler 的 findSafePoint，取最小值
-   * 最小值即为最保守的安全截断位置
+   * 串行执行各 handler 的 findSafePoint，形成逐步收紧的管道：
    *
-   * @returns 安全截断点（0 或 -1 表示不安全，buffer.length 表示全部安全）
+   * 1. 第一个 handler（BracketSafeHandler）对完整 buffer 计算截断上界
+   *    → 括号匹配通过才说明文本"可能"可以截断
+   * 2. 后续 handler 只对"准备发送的那段文本"（buffer[0..safePoint]）做检查
+   *    → 检查富媒体标签、payload 等，进一步收紧截断点
+   *
+   * 任何一步返回 0 即短路退出（不可截断，继续攒包）。
+   *
+   * @returns 安全截断点（0 表示不安全，buffer.length 表示全部安全）
    */
   findSafeFlushPoint(buffer: string): number {
     if (!buffer) return 0;
 
-    let minSafePoint = buffer.length;
+    let safePoint = buffer.length;
 
     for (const handler of this.handlers) {
-      const safePoint = handler.findSafePoint(buffer);
-      if (safePoint < minSafePoint) {
-        minSafePoint = safePoint;
+      // 对当前截断范围内的文本做检查
+      const candidate = buffer.slice(0, safePoint);
+      const point = handler.findSafePoint(candidate);
+
+      if (point < safePoint) {
+        safePoint = point;
       }
+
+      // 短路：截断点已收紧到 0，无需继续
+      if (safePoint <= 0) return 0;
     }
 
-    return minSafePoint;
+    return safePoint;
   }
 }

@@ -11,6 +11,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MediaTagHandler } from "../../src/stream-handlers/media-tag-handler.js";
 import type { StreamHandlerContext, HandleResult } from "../../src/stream-handlers/types.js";
+import { formatQQBotMarkdownImage, DEFAULT_IMAGE_SIZE } from "../../src/utils/image-size.js";
 
 // ============ 辅助函数 ============
 
@@ -391,9 +392,14 @@ describe("MediaTagHandler.findSafePoint", () => {
     expect(handler.findSafePoint("Hello world")).toBe(11);
   });
 
-  it("完整标签返回全长", () => {
+  it("完整标签返回标签前位置（阻止截断，留给 processBuffer 处理）", () => {
     const text = "前缀<qqimg>/path/file.png</qqimg>后缀";
-    expect(handler.findSafePoint(text)).toBe(text.length);
+    expect(handler.findSafePoint(text)).toBe("前缀".length);
+  });
+
+  it("只有完整标签（无前缀）返回 0", () => {
+    const text = "<qqimg>/path/file.png</qqimg>";
+    expect(handler.findSafePoint(text)).toBe(0);
   });
 
   it("不完整开始标签 '<qqimg' 在 '<' 前截断", () => {
@@ -438,14 +444,11 @@ describe("MediaTagHandler.findSafePoint", () => {
     expect(handler.findSafePoint("")).toBe(0);
   });
 
-  it("完整标签后跟不完整标签 → 在不完整标签前截断", () => {
+  it("完整标签后跟不完整标签 → 在完整标签前截断", () => {
     const text = "已完成<qqimg>/a.png</qqimg>未完成<qqim";
     const safePoint = handler.findSafePoint(text);
-    const safe = text.slice(0, safePoint);
-    // 完整的标签应被保留
-    expect(safe).toContain("<qqimg>/a.png</qqimg>");
-    // 末尾的不完整标签不应出现：safe 应截断到 "未完成" 之后、"<qqim" 之前
-    expect(safe).toBe("已完成<qqimg>/a.png</qqimg>未完成");
+    // 完整标签也需要保护（留给 processBuffer），安全点在第一个标签前
+    expect(safePoint).toBe("已完成".length);
   });
 });
 
@@ -472,17 +475,17 @@ describe("MediaTagHandler — 与责任链集成", () => {
     expect(safe).not.toContain("<qqimg>");
   });
 
-  it("完整媒体标签 → processBuffer 处理 → 不影响 safeFlushPoint", async () => {
+  it("完整媒体标签 → findSafeFlushPoint 返回标签前位置（阻止截断，留给 processBuffer）", async () => {
     const { StreamHandlerChain } = await import("../../src/stream-handlers/chain.js");
 
     const chain = new StreamHandlerChain();
     const mediaHandler = new MediaTagHandler();
     chain.register(mediaHandler);
 
-    // 完整标签，safeFlushPoint 应该等于全长
+    // 完整标签，safeFlushPoint 应该在标签前截断
     const buffer = "文字<qqimg>/tmp/test.png</qqimg>结尾";
     const safePoint = chain.findSafeFlushPoint(buffer);
-    expect(safePoint).toBe(buffer.length);
+    expect(safePoint).toBe("文字".length);
   });
 
   it("processBuffer 处理完整标签后更新 buffer", async () => {
@@ -498,5 +501,155 @@ describe("MediaTagHandler — 与责任链集成", () => {
     expect(processResult.handled).toBe(true);
     // 标签前的文本被发送，标签后的文本留在 buffer
     expect(processResult.buffer).toBe("后缀");
+  });
+});
+
+// ============ 端到端：公网图片 URL → markdown 图片语法 ============
+
+describe("MediaTagHandler — 公网图片 URL → markdown 图片输出", () => {
+  const handler = new MediaTagHandler();
+
+  /**
+   * 模拟 gateway.ts 中 sendImageAsMarkdown 的真实实现：
+   *   1. 获取图片尺寸（这里 mock 返回固定尺寸或 null）
+   *   2. 调用 formatQQBotMarkdownImage 生成 ![#宽px #高px](url)
+   *   3. 通过 sendStreamChunk 发送
+   */
+  function createContextWithRealMarkdown(
+    buffer: string,
+    imageSize: { width: number; height: number } | null = null,
+  ): StreamHandlerContext {
+    const sendStreamChunk = vi.fn().mockResolvedValue(true);
+
+    return {
+      buffer,
+      accountId: "test-account",
+      streamStarted: false,
+      streamEnded: false,
+      streamFailed: false,
+      pendingPayloadText: "",
+      sendStreamChunk,
+      interruptStream: vi.fn().mockResolvedValue(undefined),
+      rebuildStream: vi.fn(),
+      sendMediaByType: vi.fn().mockResolvedValue(undefined),
+      // 模拟 gateway 中的真实 sendImageAsMarkdown
+      sendImageAsMarkdown: vi.fn(async (imagePath: string): Promise<boolean> => {
+        const mdImage = formatQQBotMarkdownImage(imagePath, imageSize);
+        return await sendStreamChunk("\n" + mdImage + "\n", false);
+      }),
+      log: { info: vi.fn(), error: vi.fn() },
+    };
+  }
+
+  it("公网 URL 应输出 ![#宽px #高px](url) 格式（有尺寸）", async () => {
+    const url = "https://example.com/photo.png";
+    const ctx = createContextWithRealMarkdown(
+      `<qqimg>${url}</qqimg>`,
+      { width: 800, height: 600 },
+    );
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledWith(url);
+    // 验证 sendStreamChunk 收到的是 markdown 图片语法
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(1);
+    const sentText = (ctx.sendStreamChunk as any).mock.calls[0][0] as string;
+    expect(sentText).toContain(`![#800px #600px](${url})`);
+    // 验证前后有换行包裹
+    expect(sentText).toBe(`\n![#800px #600px](${url})\n`);
+  });
+
+  it("公网 URL 应输出 ![#宽px #高px](url) 格式（无尺寸，使用默认 512x512）", async () => {
+    const url = "https://cdn.example.com/images/abc.jpg";
+    const ctx = createContextWithRealMarkdown(
+      `<qqimg>${url}</qqimg>`,
+      null, // 无法获取尺寸
+    );
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(1);
+    const sentText = (ctx.sendStreamChunk as any).mock.calls[0][0] as string;
+    // 默认尺寸 512x512
+    expect(sentText).toBe(`\n![#512px #512px](${url})\n`);
+  });
+
+  it("前缀文字 + 公网图片 → 先发文字，再发 markdown 图片", async () => {
+    const url = "https://example.com/sunset.jpg";
+    const ctx = createContextWithRealMarkdown(
+      `看看这张照片<qqimg>${url}</qqimg>`,
+      { width: 1920, height: 1080 },
+    );
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    // 第一次调用：发送标签前文字
+    expect(ctx.sendStreamChunk).toHaveBeenCalledWith("看看这张照片", false);
+    // 第二次调用：发送 markdown 图片（由 sendImageAsMarkdown 内部调用）
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(2);
+    const mdCall = (ctx.sendStreamChunk as any).mock.calls[1][0] as string;
+    expect(mdCall).toBe(`\n![#1920px #1080px](${url})\n`);
+  });
+
+  it("多个公网图片 → 每个都生成独立的 markdown 图片", async () => {
+    const url1 = "https://example.com/a.png";
+    const url2 = "https://example.com/b.jpg";
+    const ctx = createContextWithRealMarkdown(
+      `图1<qqimg>${url1}</qqimg>图2<qqimg>${url2}</qqimg>`,
+      { width: 256, height: 256 },
+    );
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    // sendImageAsMarkdown 应被调用两次
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledTimes(2);
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledWith(url1);
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledWith(url2);
+
+    // sendStreamChunk 调用：文字1 + 图片1 + 文字2 + 图片2 = 4 次
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(4);
+
+    // 验证每个图片的 markdown 格式
+    const calls = (ctx.sendStreamChunk as any).mock.calls;
+    expect(calls[0][0]).toBe("图1");
+    expect(calls[1][0]).toBe(`\n![#256px #256px](${url1})\n`);
+    expect(calls[2][0]).toBe("图2");
+    expect(calls[3][0]).toBe(`\n![#256px #256px](${url2})\n`);
+  });
+
+  it("别名标签 <image> 公网 URL → 同样输出 markdown 图片", async () => {
+    const url = "https://example.com/photo.png";
+    const ctx = createContextWithRealMarkdown(
+      `<image>${url}</image>`,
+      { width: 640, height: 480 },
+    );
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(1);
+    const sentText = (ctx.sendStreamChunk as any).mock.calls[0][0] as string;
+    expect(sentText).toBe(`\n![#640px #480px](${url})\n`);
+  });
+
+  it("图片 URL 后有剩余文字 → markdown 图片发出后，剩余文字留在 buffer", async () => {
+    const url = "https://example.com/cat.gif";
+    const ctx = createContextWithRealMarkdown(
+      `<qqimg>${url}</qqimg>好可爱！`,
+      { width: 320, height: 240 },
+    );
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(result.newBuffer).toBe("好可爱！");
+
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(1);
+    const sentText = (ctx.sendStreamChunk as any).mock.calls[0][0] as string;
+    expect(sentText).toBe(`\n![#320px #240px](${url})\n`);
   });
 });
