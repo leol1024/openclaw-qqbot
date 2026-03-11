@@ -1066,6 +1066,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
         
         /** 发送文本消息（自动根据 event.type 分派到 c2c/group/dm/channel） */
         const sendTextMessage = async (text: string) => {
+          log?.info(`[qqbot:${account.accountId}] [send-text] type=${event.type}, len=${text.length}, text=${JSON.stringify(text)}`);
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CMessage(token, event.senderId, text, event.messageId);
@@ -1081,6 +1082,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
         /** 发送图片消息（URL 或 Base64 DataURL，自动四路分派） */
         const sendImageMessage = async (imageUrl: string, altMarkdown?: string) => {
+          const isDataUrl = imageUrl.startsWith("data:");
+          log?.info(`[qqbot:${account.accountId}] [send-image] type=${event.type}${isDataUrl ? `, dataUrl(len=${imageUrl.length})` : `, url=${imageUrl.slice(0, 120)}`}${altMarkdown ? `, alt=${altMarkdown.slice(0, 60)}` : ""}`);
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CImageMessage(token, event.senderId, imageUrl, event.messageId);
@@ -1110,6 +1113,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
         /** 发送语音消息（自动四路分派） */
         const sendVoiceMessage = async (silkBase64: string) => {
+          log?.info(`[qqbot:${account.accountId}] [send-voice] type=${event.type}, dataLen=${silkBase64.length}`);
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId);
@@ -1125,6 +1129,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
         /** 发送视频消息（URL 或 Base64，自动四路分派） */
         const sendVideoMessage = async (url?: string, base64?: string) => {
+          log?.info(`[qqbot:${account.accountId}] [send-video] type=${event.type}${url ? `, url=${url.slice(0, 120)}` : ""}${base64 ? `, base64(len=${base64.length})` : ""}`);
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CVideoMessage(token, event.senderId, url, base64, event.messageId);
@@ -1140,6 +1145,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
         /** 发送文件消息（URL 或 Base64，自动四路分派） */
         const sendFileMessage = async (base64?: string, url?: string, fileName?: string) => {
+          log?.info(`[qqbot:${account.accountId}] [send-file] type=${event.type}${fileName ? `, name=${fileName}` : ""}${url ? `, url=${url.slice(0, 120)}` : ""}${base64 ? `, base64(len=${base64.length})` : ""}`);
           await sendWithTokenRetry(async (token) => {
             if (event.type === MSG_TYPE_C2C) {
               await sendC2CFileMessage(token, event.senderId, base64, url, event.messageId, fileName);
@@ -1559,6 +1565,11 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
            * 检测文本末尾是否存在不完整的媒体标签或 markdown 链接
            * 返回安全的分割点（从末尾往前找到可以安全截断的位置）
            * 注：代码块、行内代码、加粗等 markdown 格式不需要等待闭合
+           * 
+           * 返回值语义：
+           *   > 0 : 从该位置截断发送
+           *   0   : 文本以不安全字符开头（如 [），整段都不安全，继续攒
+           *  -1   : 无法找到安全点（不应发生），继续攒
            */
           const findSafeFlushPoint = (text: string): number => {
             const len = text.length;
@@ -1572,11 +1583,79 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             }
 
             // 1. 检查不完整的 markdown 链接 [text](url)
-            //    从后往前找最后一个未闭合的 '['
+            //    完整的 markdown 链接格式：[显示文本](URL)
+            //    需要保护的不完整状态：
+            //      a. [text           — [ 未闭合
+            //      b. [text](url      — ]( 后面的 URL 未闭合（缺少 )）
+            //      c. [text](         — 刚开始 URL 部分
+            //    
+            //    注意：markdown 图片 ![alt](url) 也需要保护，! 在 [ 前面
+
+            // 从后往前搜索，限制回溯范围（URL 最长 2048 + 链接文字最长 256）
+            const MAX_LINK_SCAN = Math.min(len, 2400);
+            const scanStart = len - MAX_LINK_SCAN;
+
+            // 先检查是否有未闭合的 ]( — 即 URL 部分正在生成中
+            // 从末尾往前找最后一个 ](
+            let linkUrlStart = -1;
+            for (let i = len - 1; i >= scanStart + 1; i--) {
+              if (text[i] === '(' && text[i - 1] === ']') {
+                // 检查这个 ]( 后面是否有匹配的 )
+                const afterParen = text.slice(i + 1);
+                if (!afterParen.includes(')')) {
+                  linkUrlStart = i - 1; // 指向 ] 的位置
+                  break;
+                }
+                // 有 )，这个链接是完整的，不需要保护
+                break;
+              }
+            }
+
+            if (linkUrlStart >= 0) {
+              // URL 部分未闭合，往前找对应的 [（跳过嵌套的 []）
+              let depth = 0;
+              for (let i = linkUrlStart - 1; i >= scanStart; i--) {
+                if (text[i] === ']') depth++;
+                else if (text[i] === '[') {
+                  if (depth > 0) { depth--; }
+                  else {
+                    // 找到匹配的 [，检查前面是否有 !（markdown 图片）
+                    const cutPos = (i > 0 && text[i - 1] === '!') ? i - 1 : i;
+                    return cutPos; // 在 [ 或 ![ 前截断
+                  }
+                }
+              }
+              return linkUrlStart; // 找不到 [，在 ] 处截断
+            }
+
+            // 再检查是否有未闭合的 [ — 即链接文字正在生成中
             let bracketDepth = 0;
             let lastOpenBracket = -1;
-            for (let i = len - 1; i >= 0; i--) {
+            for (let i = len - 1; i >= scanStart; i--) {
               const ch = text[i];
+              if (ch === ')') {
+                // 遇到 )，可能是一个完整链接的结尾，跳过整个链接
+                // 往前找匹配的 ](
+                let j = i - 1;
+                while (j >= scanStart && text[j] !== '(') j--;
+                if (j >= scanStart + 1 && text[j] === '(' && text[j - 1] === ']') {
+                  // 找到 ](，再往前找 [
+                  let d = 0;
+                  let k = j - 2;
+                  while (k >= scanStart) {
+                    if (text[k] === ']') d++;
+                    else if (text[k] === '[') {
+                      if (d > 0) d--;
+                      else {
+                        i = k; // 跳过整个完整链接
+                        break;
+                      }
+                    }
+                    k--;
+                  }
+                }
+                continue;
+              }
               if (ch === ']') {
                 bracketDepth++;
               } else if (ch === '[') {
@@ -1590,31 +1669,11 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               }
             }
             if (lastOpenBracket >= 0) {
-              // 有未闭合的 [ ，在 [ 前面截断
-              return lastOpenBracket;
-            }
-
-            // 检查结尾是否是 ](... 即链接的 URL 部分未闭合
-            const tailForLink = text.slice(Math.max(0, len - 2048));
-            const lastCloseBracket = tailForLink.lastIndexOf('](');
-            if (lastCloseBracket >= 0) {
-              // 找到 ]( 后，检查后面是否有 )
-              const afterLink = tailForLink.slice(lastCloseBracket + 2);
-              if (!afterLink.includes(')')) {
-                // URL 部分未闭合，在 ]( 对应的 [ 前截断
-                const searchFrom = Math.max(0, len - 2048);
-                const absPos = searchFrom + lastCloseBracket;
-                // 往前找对应的 [
-                let depth = 0;
-                for (let i = absPos - 1; i >= 0; i--) {
-                  if (text[i] === ']') depth++;
-                  else if (text[i] === '[') {
-                    if (depth > 0) depth--;
-                    else return i;
-                  }
-                }
-                return absPos; // 找不到 [，在 ]( 处截断
-              }
+              // 有未闭合的 [，检查前面是否有 !（markdown 图片 ![）
+              const cutPos = (lastOpenBracket > 0 && text[lastOpenBracket - 1] === '!') 
+                ? lastOpenBracket - 1 
+                : lastOpenBracket;
+              return cutPos;
             }
 
             // 代码块 ```、行内代码 `、加粗 ** 等不需要等待闭合
@@ -1675,7 +1734,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               log?.error(`[qqbot:${account.accountId}] Stream send error: ${result.error}`);
               return false;
             }
-            log?.debug?.(`[qqbot:${account.accountId}] Stream chunk sent, index: ${streamSender.getContext().index - 1}, isEnd: ${isEnd}, text: "${text.slice(0, 50)}..."`);
+            const ctx = streamSender.getContext();
+            log?.info(`[qqbot:${account.accountId}] [stream-chunk] index=${ctx.index - 1}, isEnd=${isEnd}, len=${text.length}, text=${JSON.stringify(text)}`);
             if (isEnd) {
               streamEnded = true;
               clearKeepalive();
