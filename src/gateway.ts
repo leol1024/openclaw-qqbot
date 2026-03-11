@@ -1520,6 +1520,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           let sendingLock = false; // 发送锁，防止并发发送
           let pendingPayloadText = ""; // 暂存 QQBOT_PAYLOAD 结构化载荷全文（流式结束后处理）
           let keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
+          const MAX_KEEPALIVE_COUNT = 10; // 最大连续空保活次数，超过后只能通过发送实际消息来续
 
           // 清理心跳定时器
           const clearKeepalive = () => {
@@ -1529,26 +1530,31 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             }
           };
 
-          // 重置心跳定时器（每次发送后调用）
+          // 重置心跳定时器
           // keepalive 必须发送空字符串，这是 QQ 通道的要求
           // ⚠️ 捕获注册时的 sender 实例，防止 rebuildStream 后用已 END 的旧 sender 发送
-          const resetKeepalive = () => {
+          // @param count 当前连续空保活次数（外部消息发送后传 0，保活自递归时传 count+1）
+          const resetKeepalive = (count = 0) => {
             clearKeepalive();
-            if (streamSender && streamStarted && !streamEnded) {
+            if (streamSender && streamStarted && !streamEnded && !streamFailed) {
               const senderAtRegistration = streamSender; // 捕获当前实例
               keepaliveTimer = setTimeout(async () => {
                 // 二次检查：确保 sender 没有被 rebuild 替换，且流式未结束
-                if (!streamEnded && !sendingLock && streamSender === senderAtRegistration) {
-                  log?.info(`[qqbot:${account.accountId}] 💓 Sending stream keepalive: sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
+                if (!streamEnded && !streamFailed && !sendingLock && streamSender === senderAtRegistration) {
+                  if (count >= MAX_KEEPALIVE_COUNT) {
+                    log?.info(`[qqbot:${account.accountId}] 💓 Keepalive suppressed: consecutive count ${count} reached limit ${MAX_KEEPALIVE_COUNT}, waiting for actual message to resume. sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
+                    return;
+                  }
+                  log?.info(`[qqbot:${account.accountId}] 💓 Sending stream keepalive (${count + 1}/${MAX_KEEPALIVE_COUNT}): sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
                   sendingLock = true;
                   try {
                     // 三次检查：拿到锁后再确认一次（锁等待期间状态可能已变）
-                    if (streamEnded || streamSender !== senderAtRegistration) {
+                    if (streamEnded || streamFailed || streamSender !== senderAtRegistration) {
                       log?.info(`[qqbot:${account.accountId}] 💓 Keepalive skipped: stream state changed while acquiring lock, sender=${senderAtRegistration.instanceId}, currentSender=${streamSender?.instanceId}, streamEnded=${streamEnded}`);
                       return;
                     }
                     await streamSender.send("", false);
-                    resetKeepalive();
+                    resetKeepalive(count + 1);
                   } catch (err) {
                     log?.error(`[qqbot:${account.accountId}] 💓 Keepalive failed: sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}, error=${err}`);
                   } finally {
@@ -1918,6 +1924,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   } else {
                     // 流式发送失败，停止当前消息发送
                     streamFailed = true;
+                    clearKeepalive(); // 立即停止保活，防止继续发送空分片
                     log?.error(`[qqbot:${account.accountId}] ❌ Stream send failed in onPartialReply: sender=${streamSender?.instanceId}, streamId=${streamSender?.getContext().streamId}, stopping current message`);
                     streamBuffer = "";
                     return;
