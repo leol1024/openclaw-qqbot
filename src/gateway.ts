@@ -10,7 +10,8 @@ import { startImageServer, isImageServerRunning, downloadFile, type ImageServerC
 import { getImageSize, formatQQBotMarkdownImage, hasQQBotImageSize, DEFAULT_IMAGE_SIZE } from "./utils/image-size.js";
 import { parseQQBotPayload, encodePayloadForCron, isCronReminderPayload, isMediaPayload, type CronReminderPayload, type MediaPayload } from "./utils/payload.js";
 import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
-import { normalizeMediaTags, findMediaTagSafePoint, parseMediaTags, MEDIA_TAG_REGEX, INCOMPLETE_MEDIA_TAG_REGEX, decodeMediaPath, tagNameToQueueType, filterInternalMarkers } from "./utils/media-tags.js";
+import { normalizeMediaTags, parseMediaTags, INCOMPLETE_MEDIA_TAG_REGEX, decodeMediaPath, tagNameToQueueType, filterInternalMarkers } from "./utils/media-tags.js";
+import { createDefaultChain, type StreamHandlerContext } from "./stream-handlers/index.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
 import { createStreamSender } from "./outbound.js";
@@ -1372,7 +1373,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
         };
 
         // ============ 公共函数：按媒体类型发送单个富媒体 ============
-        // 统一处理 processMediaInBuffer 和 deliver sendQueue 中的媒体发送逻辑
+        // 统一处理 stream-handlers 和 deliver sendQueue 中的媒体发送逻辑
         // mediaType: "image" | "voice" | "video" | "file"
         // mediaPath: 已 decode 后的路径
         const sendMediaByType = async (mediaType: string, mediaPath: string): Promise<void> => {
@@ -1513,7 +1514,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           let streamSender = supportsStream ? createStreamSender(account, targetTo, event.messageId) : null;
           let streamStarted = false; // 是否已开始流式发送
           let streamEnded = false; // 流式是否已结束
-          let streamFailed = false; // 流式是否失败（降级为普通消息）
+          let streamFailed = false; // 流式是否失败（停止当前消息发送）
           let sendingLock = false; // 发送锁，防止并发发送
           let pendingPayloadText = ""; // 暂存 QQBOT_PAYLOAD 结构化载荷全文（流式结束后处理）
           let keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1553,178 +1554,15 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           // QQ Bot 的特殊限制：
           //   1. markdown 链接 [text](url) 必须完整发送，截断会导致消息发不出去
           //   2. 媒体标签 <qqimg>/<qqvoice>/<qqvideo>/<qqfile> 必须完整发送
-          //   注：代码块 ```、行内代码 `、加粗 ** 等不需要等待闭合，QQ 客户端能正确处理
+          //   3. QQBOT_PAYLOAD 结构化载荷不应流式发送
           //
-          // 这是 QQ 通道特有的限制，框架的 block streaming coalesce 不处理这些
-          // 因此我们在 deliver → StreamSender 之间增加一层缓冲
+          // 特殊格式通过 stream-handlers 责任链统一处理
           //
           let streamBuffer = ""; // 攒包缓冲区
           const STREAM_MIN_FLUSH_CHARS = 10; // 缓冲区最小刷新字符数
 
-          /**
-           * 检测文本末尾是否存在不完整的媒体标签或 markdown 链接
-           * 返回安全的分割点（从末尾往前找到可以安全截断的位置）
-           * 注：代码块、行内代码、加粗等 markdown 格式不需要等待闭合
-           * 
-           * 返回值语义：
-           *   > 0 : 从该位置截断发送
-           *   0   : 文本以不安全字符开头（如 [），整段都不安全，继续攒
-           *  -1   : 无法找到安全点（不应发生），继续攒
-           */
-          const findSafeFlushPoint = (text: string): number => {
-            const len = text.length;
-            if (len === 0) return 0;
-
-            // 0. 检查不完整的媒体标签 <qqimg>..., <qqvoice>..., <qqvideo>..., <qqfile>...
-            //    媒体标签被截断会导致 QQ API 无法识别，优先级最高
-            const mediaTagSafePoint = findMediaTagSafePoint(text);
-            if (mediaTagSafePoint < len) {
-              return mediaTagSafePoint;
-            }
-
-            // 1. 检查不完整的 markdown 链接 [text](url)
-            //    完整的 markdown 链接格式：[显示文本](URL)
-            //    需要保护的不完整状态：
-            //      a. [text           — [ 未闭合
-            //      b. [text](url      — ]( 后面的 URL 未闭合（缺少 )）
-            //      c. [text](         — 刚开始 URL 部分
-            //    
-            //    注意：markdown 图片 ![alt](url) 也需要保护，! 在 [ 前面
-
-            // 从后往前搜索，限制回溯范围（URL 最长 2048 + 链接文字最长 256）
-            const MAX_LINK_SCAN = Math.min(len, 2400);
-            const scanStart = len - MAX_LINK_SCAN;
-
-            // 先检查是否有未闭合的 ]( — 即 URL 部分正在生成中
-            // 从末尾往前找最后一个 ](
-            let linkUrlStart = -1;
-            for (let i = len - 1; i >= scanStart + 1; i--) {
-              if (text[i] === '(' && text[i - 1] === ']') {
-                // 检查这个 ]( 后面是否有匹配的 )
-                const afterParen = text.slice(i + 1);
-                if (!afterParen.includes(')')) {
-                  linkUrlStart = i - 1; // 指向 ] 的位置
-                  break;
-                }
-                // 有 )，这个链接是完整的，不需要保护
-                break;
-              }
-            }
-
-            if (linkUrlStart >= 0) {
-              // URL 部分未闭合，往前找对应的 [（跳过嵌套的 []）
-              let depth = 0;
-              for (let i = linkUrlStart - 1; i >= scanStart; i--) {
-                if (text[i] === ']') depth++;
-                else if (text[i] === '[') {
-                  if (depth > 0) { depth--; }
-                  else {
-                    // 找到匹配的 [，检查前面是否有 !（markdown 图片）
-                    const cutPos = (i > 0 && text[i - 1] === '!') ? i - 1 : i;
-                    return cutPos; // 在 [ 或 ![ 前截断
-                  }
-                }
-              }
-              return linkUrlStart; // 找不到 [，在 ] 处截断
-            }
-
-            // 再检查是否有未闭合的 [ — 即链接文字正在生成中
-            let bracketDepth = 0;
-            let lastOpenBracket = -1;
-            for (let i = len - 1; i >= scanStart; i--) {
-              const ch = text[i];
-              if (ch === ')') {
-                // 遇到 )，可能是一个完整链接的结尾，跳过整个链接
-                // 往前找匹配的 ](
-                let j = i - 1;
-                while (j >= scanStart && text[j] !== '(') j--;
-                if (j >= scanStart + 1 && text[j] === '(' && text[j - 1] === ']') {
-                  // 找到 ](，再往前找 [
-                  let d = 0;
-                  let k = j - 2;
-                  while (k >= scanStart) {
-                    if (text[k] === ']') d++;
-                    else if (text[k] === '[') {
-                      if (d > 0) d--;
-                      else {
-                        i = k; // 跳过整个完整链接
-                        break;
-                      }
-                    }
-                    k--;
-                  }
-                }
-                continue;
-              }
-              if (ch === ']') {
-                bracketDepth++;
-              } else if (ch === '[') {
-                if (bracketDepth > 0) {
-                  bracketDepth--;
-                } else {
-                  // 未闭合的 '['
-                  lastOpenBracket = i;
-                  break;
-                }
-              }
-            }
-            if (lastOpenBracket >= 0) {
-              // 有未闭合的 [，检查前面是否有 !（markdown 图片 ![）
-              const cutPos = (lastOpenBracket > 0 && text[lastOpenBracket - 1] === '!') 
-                ? lastOpenBracket - 1 
-                : lastOpenBracket;
-              return cutPos;
-            }
-
-            // 代码块 ```、行内代码 `、加粗 ** 等不需要等待闭合
-            // QQ 客户端能正确处理这些不完整的 markdown 片段
-            // 只有媒体标签和 markdown 链接因为截断会导致发送失败，才需要等待
-
-            // 全部安全，可以全部发送
-            return len;
-          };
-
-          /**
-           * 将文本加入缓冲区，在安全点刷新发送
-           * @param text 新增的文本
-           * @param forceFlush 强制刷新（结束时使用）
-           * @returns 是否发送成功
-           */
-          const bufferAndSend = async (text: string, forceFlush: boolean): Promise<boolean> => {
-            streamBuffer += text;
-
-            if (forceFlush) {
-              // 强制刷新：结束时发送所有剩余内容
-              if (streamBuffer) {
-                const success = await sendStreamChunk(streamBuffer, false);
-                if (success) {
-                  streamBuffer = "";
-                }
-                return success;
-              }
-              return true;
-            }
-
-            // 缓冲区太小，继续攒
-            if (streamBuffer.length < STREAM_MIN_FLUSH_CHARS) {
-              return true;
-            }
-
-            // 找安全分割点
-            const safePoint = findSafeFlushPoint(streamBuffer);
-            if (safePoint <= 0) {
-              // 没有安全点，继续攒
-              return true;
-            }
-
-            const toSend = streamBuffer.slice(0, safePoint);
-            streamBuffer = streamBuffer.slice(safePoint);
-
-            if (toSend) {
-              return await sendStreamChunk(toSend, false);
-            }
-            return true;
-          };
+          // 创建处理器责任链
+          const handlerChain = createDefaultChain();
 
           // 流式发送分片（增量文本）
           const sendStreamChunk = async (text: string, isEnd: boolean): Promise<boolean> => {
@@ -1783,40 +1621,52 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           };
 
           /**
-           * 流式发送文本（带降级逻辑）
-           * - 流式正常：通过 bufferAndSend 增量发送
-           * - 流式失败：降级为普通消息发送
+           * 流式发送文本
+           * - 流式正常：将文本加入 buffer 并按安全点发送
+           * - 流式失败：打印错误，停止发送
            * - 非流式：直接普通发送
            */
           const streamSendTextOrFallback = async (text: string) => {
             if (!text.trim()) return;
             
             if (supportsStream && streamSender && !streamFailed) {
-              // 流式发送
+              // 流式发送：加入 buffer，按安全点发送
               while (sendingLock) {
                 await new Promise(resolve => setTimeout(resolve, 50));
               }
               sendingLock = true;
               try {
-                const success = await bufferAndSend(text, false);
-                if (success) {
-                  streamStarted = true;
-                  log?.info(`[qqbot:${account.accountId}] Stream text buffered, buffer: ${streamBuffer.length} chars`);
-                } else {
-                  // 流式失败，降级为普通发送
-                  streamFailed = true;
-                  log?.error(`[qqbot:${account.accountId}] Stream send failed, falling back to normal send`);
-                  const fallbackText = streamBuffer + text;
-                  streamBuffer = "";
-                  await sendTextMessage(fallbackText);
+                streamBuffer += text;
+
+                // 循环发送安全分片
+                while (streamBuffer.length >= STREAM_MIN_FLUSH_CHARS) {
+                  const safePoint = handlerChain.findSafeFlushPoint(streamBuffer);
+                  if (safePoint <= 0) break;
+
+                  const toSend = streamBuffer.slice(0, safePoint);
+                  streamBuffer = streamBuffer.slice(safePoint);
+
+                  if (toSend) {
+                    const success = await sendStreamChunk(toSend, false);
+                    if (success) {
+                      streamStarted = true;
+                    } else {
+                      // 流式失败，停止当前消息发送
+                      streamFailed = true;
+                      log?.error(`[qqbot:${account.accountId}] Stream send failed, stopping current message`);
+                      streamBuffer = "";
+                      return;
+                    }
+                  }
                 }
+
+                log?.info(`[qqbot:${account.accountId}] Stream text buffered, buffer: ${streamBuffer.length} chars`);
               } finally {
                 sendingLock = false;
               }
             } else if (supportsStream && streamFailed) {
-              // 流式已降级，普通发送
-              await sendTextMessage(text);
-              log?.info(`[qqbot:${account.accountId}] Sent text (stream-fallback)`);
+              // 流式已失败，跳过发送
+              log?.info(`[qqbot:${account.accountId}] Stream failed, skipping text send`);
             } else {
               // 非流式：普通发送
               await sendTextMessage(text);
@@ -1828,7 +1678,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           //
           // onPartialReply 在 AI 生成过程中被 token 级别实时调用
           // payload.text 是**累积全文**（非增量），需要跟踪已发送长度计算 delta
-          // 通过 bufferAndSend 攒包逻辑发送，保留安全分割点检测
+          // 通过 stream-handlers 责任链处理特殊格式，保留安全分割点检测
           //
           // 流式模式下 deliver 统一跳过，所有内容都由 onPartialReply 处理：
           //   - 纯文本 → 攒包缓冲 → 流式增量发送
@@ -1838,133 +1688,60 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           let partialReplySentLength = 0; // 已通过 onPartialReply 发送的累积文本长度
 
           /**
-           * 处理攒包缓冲区中的完整媒体标签
-           * 
-           * 检测缓冲区中是否有完整的媒体标签（如 <qqimg>path</qqimg>），
-           * 如果有则按顺序处理：标签前文本 → 流式发送，富媒体 → 中断流式发富媒体再重建，标签后文本 → 留在缓冲区
-           * 
-           * ⚠️ 此函数在 handlePartialReply 中持有 sendingLock 的状态下被调用，
-           *    因此不能调用 interruptStream（它也使用 sendingLock，会死锁），
-           *    需要内联执行中断/重建逻辑。
-           * 
-           * @returns 是否成功（false 表示流式已降级）
+           * 构建 StreamHandlerContext —— 将 gateway 闭包状态桥接给 handler 链
+           *
+           * ⚠️ 在 sendingLock 保护下调用，handler 内部不需要感知锁
            */
-          const processMediaInBuffer = async (): Promise<boolean> => {
-            if (!streamBuffer || streamFailed || streamEnded) return true;
-
-            // 先 normalize 缓冲区中的标签（修正小模型的拼写错误）
-            streamBuffer = normalizeMediaTags(streamBuffer);
-
-            // 检测缓冲区中是否有完整的媒体标签
-            const regex = new RegExp(MEDIA_TAG_REGEX.source, MEDIA_TAG_REGEX.flags);
-            const matches = [...streamBuffer.matchAll(regex)];
-            log?.info(`[qqbot:${account.accountId}] processMediaInBuffer: matches=${matches.length}, buffer=${JSON.stringify(streamBuffer)}`);
-            if (matches.length === 0) return true;
-
-            // 内联中断流式（不使用 interruptStream 避免死锁）
-            const doInterrupt = async () => {
+          const buildHandlerContext = (): StreamHandlerContext => ({
+            buffer: streamBuffer,
+            accountId: account.accountId,
+            get streamStarted() { return streamStarted; },
+            set streamStarted(v: boolean) { streamStarted = v; },
+            get streamEnded() { return streamEnded; },
+            set streamEnded(v: boolean) { streamEnded = v; },
+            get streamFailed() { return streamFailed; },
+            set streamFailed(v: boolean) { streamFailed = v; },
+            get pendingPayloadText() { return pendingPayloadText; },
+            set pendingPayloadText(v: string) { pendingPayloadText = v; },
+            sendStreamChunk,
+            // 内联中断（在 sendingLock 保护下，不能调用外层 interruptStream 避免死锁）
+            interruptStream: async () => {
               if (streamStarted && !streamEnded) {
-                // buffer 内剩余的媒体前文本已在主循环中处理，此处不再刷 streamBuffer
                 await streamSender!.end("");
                 streamEnded = true;
                 clearKeepalive();
-                log?.info(`[qqbot:${account.accountId}] [onPartialReply] Stream interrupted for media send`);
+                log?.info(`[qqbot:${account.accountId}] [handler] Stream interrupted for media send`);
               }
-            };
-
-            // 内联重建流式
-            const doRebuild = () => {
+            },
+            rebuildStream: () => {
               streamSender = createStreamSender(account, targetTo, event.messageId);
               streamStarted = false;
               streamEnded = false;
-              log?.info(`[qqbot:${account.accountId}] [onPartialReply] StreamSender rebuilt`);
-            };
-
-            // 有完整的媒体标签，按顺序处理
-            let lastIndex = 0;
-            for (const match of matches) {
-              // 1. 发送标签前的纯文本（通过流式）
-              const textBefore = streamBuffer.slice(lastIndex, match.index);
-              if (textBefore.trim()) {
-                const filteredText = filterInternalMarkers(textBefore);
-                if (filteredText) {
-                  const success = await sendStreamChunk(filteredText, false);
-                  if (!success) {
-                    streamFailed = true;
-                    return false;
-                  }
-                  streamStarted = true;
-                }
+              log?.info(`[qqbot:${account.accountId}] [handler] StreamSender rebuilt`);
+            },
+            sendMediaByType,
+            // 公网图片 → markdown 嵌入流式（不中断）
+            sendImageAsMarkdown: async (imagePath: string): Promise<boolean> => {
+              try {
+                const size = await getImageSize(imagePath);
+                const mdImage = formatQQBotMarkdownImage(imagePath, size);
+                log?.info(`[qqbot:${account.accountId}] [handler] Embedding HTTP image as markdown: ${size ? `${size.width}x${size.height}` : 'default'}`);
+                return await sendStreamChunk("\n" + mdImage + "\n", false);
+              } catch (err) {
+                log?.info(`[qqbot:${account.accountId}] [handler] Failed to get image size, using default: ${err}`);
+                const mdImage = formatQQBotMarkdownImage(imagePath, null);
+                return await sendStreamChunk("\n" + mdImage + "\n", false);
               }
-
-              // 2. 处理富媒体标签
-              const tagName = match[1]!.toLowerCase();
-              const rawPath = match[2] ?? "";
-              const mediaPath = decodeMediaPath(rawPath);
-
-              if (mediaPath) {
-                const mediaType = tagNameToQueueType(tagName);
-
-                if (mediaType === "image") {
-                  // 图片在流式场景有特殊处理：公网 URL → markdown 嵌入（不中断），本地 → 中断→发送→重建
-                  const imagePath = normalizePath(mediaPath);
-                  const isHttpUrl = imagePath.startsWith("http://") || imagePath.startsWith("https://");
-                  const isLocalPath = isLocalFilePath(imagePath);
-
-                  if (isHttpUrl) {
-                    // 公网 URL → markdown 图片格式嵌入流式（不中断）
-                    try {
-                      const size = await getImageSize(imagePath);
-                      const mdImage = formatQQBotMarkdownImage(imagePath, size);
-                      log?.info(`[qqbot:${account.accountId}] [onPartialReply] Embedding HTTP image as markdown in stream: ${size ? `${size.width}x${size.height}` : 'default'}`);
-                      const success = await sendStreamChunk("\n" + mdImage + "\n", false);
-                      if (!success) { streamFailed = true; return false; }
-                      streamStarted = true;
-                    } catch (err) {
-                      log?.info(`[qqbot:${account.accountId}] [onPartialReply] Failed to get image size, using default: ${err}`);
-                      const mdImage = formatQQBotMarkdownImage(imagePath, null);
-                      const success = await sendStreamChunk("\n" + mdImage + "\n", false);
-                      if (!success) { streamFailed = true; return false; }
-                      streamStarted = true;
-                    }
-                  } else if (isLocalPath) {
-                    // 本地图片 → 中断流式 → 富媒体 API → 重建
-                    await doInterrupt();
-                    await sendMediaByType("image", mediaPath);
-                    doRebuild();
-                  } else {
-                    log?.error(`[qqbot:${account.accountId}] [onPartialReply] Invalid image path: ${imagePath}`);
-                  }
-                } else {
-                  // 语音/视频/文件 → 中断流式 → 发送 → 重建
-                  log?.info(`[qqbot:${account.accountId}] [onPartialReply] ${mediaType} tag, interrupting stream`);
-                  await doInterrupt();
-                  await sendMediaByType(mediaType, mediaPath);
-                  doRebuild();
-                }
-              }
-
-              lastIndex = match.index! + match[0].length;
-            }
-
-            // 3. 标签后的剩余文本留在缓冲区
-            streamBuffer = streamBuffer.slice(lastIndex);
-            log?.info(`[qqbot:${account.accountId}] processMediaInBuffer: done, lastIndex=${lastIndex}, remaining buffer=${JSON.stringify(streamBuffer)}`);
-            return true;
-          };
+            },
+            log: log ? { info: log.info.bind(log), error: log.error.bind(log) } : undefined,
+          });
 
           /**
-           * 安全刷新 streamBuffer（处理完整标签 + 不完整标签 + 剩余纯文本）
-           * 
+           * 安全刷新 streamBuffer（通过责任链处理完整/不完整媒体标签 + 剩余纯文本）
+           *
            * 在所有需要强制刷新 streamBuffer 的场景使用（结束、中断、超时等），
            * 避免将未处理的媒体标签作为纯文本发送。
-           * 
-           * 处理流程：
-           *   1. processMediaInBuffer() 处理完整标签（<qqvideo>url</qqvideo>）
-           *   2. 检测不完整标签（只有 <qqvideo>url 没有 </qqvideo>），
-           *      提取标签前文本 → 流式发送，媒体内容记入 pendingMedia 待后续处理
-           *   3. 剩余纯文本通过 sendStreamChunk 发送
-           * 
+           *
            * @returns 提取出的待发送媒体列表（调用者在流式结束后独立发送）
            */
           const flushStreamBufferSafe = async (): Promise<Array<{ type: string; path: string }>> => {
@@ -1972,18 +1749,20 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: enter, buffer=${JSON.stringify(streamBuffer)}`);
             if (!streamBuffer) return pendingMedia;
 
-            // 1. 处理完整的媒体标签（需要在 sendingLock 保护下调用）
+            // 1. 通过责任链处理完整的媒体标签
             while (sendingLock) {
               await new Promise(resolve => setTimeout(resolve, 50));
             }
             sendingLock = true;
             try {
-              await processMediaInBuffer();
+              const ctx = buildHandlerContext();
+              await handlerChain.processBuffer(ctx);
+              streamBuffer = ctx.buffer;
             } finally {
               sendingLock = false;
             }
 
-            log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: after processMediaInBuffer, buffer=${JSON.stringify(streamBuffer)}`);
+            log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: after chain.processBuffer, buffer=${JSON.stringify(streamBuffer)}`);
             if (!streamBuffer) return pendingMedia;
 
             // 2. 检测不完整的媒体标签（AI 没有输出闭合标签的情况）
@@ -2034,6 +1813,15 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             return pendingMedia;
           };
 
+          // ============ onPartialReply 回调（C2C 流式专用） ============
+          //
+          // 四步流水线：
+          //   1. 攒包：计算 delta，追加到 streamBuffer
+          //   2. 责任链主动处理：QQBOT_PAYLOAD 拦截、完整媒体标签中断/发送/重建
+          //   3. 判断能否发送：达到字符阈值 + 无特殊格式阻断（链安全点）
+          //   4. 循环发送安全分片
+          //
+
           const handlePartialReply = supportsStream ? async (payload: { text?: string }) => {
             if (!streamSender || streamEnded || streamFailed) return;
 
@@ -2042,15 +1830,6 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             hasResponse = true;
 
-            // 检测是否为 QQBOT_PAYLOAD 结构化载荷
-            // payload 以 "QQBOT_PAYLOAD:" 开头，不应当作文本流式发送给用户
-            // 暂存到 pendingPayloadText，在流式结束阶段统一处理
-            if (fullText.trimStart().startsWith("QQBOT_PAYLOAD:")) {
-              pendingPayloadText = fullText;
-              partialReplySentLength = fullText.length;
-              return;
-            }
-
             // 如果之前已经标记为 payload（正在逐步生成中），持续暂存
             if (pendingPayloadText) {
               pendingPayloadText = fullText;
@@ -2058,51 +1837,53 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               return;
             }
 
-            // 计算增量文本
+            // ---- 步骤 1: 攒包 ----
             const delta = fullText.slice(partialReplySentLength);
             log?.info(`[qqbot:${account.accountId}] handlePartialReply: fullLen=${fullText.length}, sentLen=${partialReplySentLength}, delta=${JSON.stringify(delta)}, buffer=${JSON.stringify(streamBuffer)}, fullText=${JSON.stringify(fullText)}`);
             partialReplySentLength = fullText.length;
-
-            // 将增量加入攒包缓冲区
             streamBuffer += delta;
 
-            // 先检测并处理缓冲区中的完整媒体标签
+            // 获取发送锁
             while (sendingLock) {
               await new Promise(resolve => setTimeout(resolve, 50));
             }
             sendingLock = true;
             try {
-              // 处理缓冲区中的完整媒体标签（如果有）
-              const mediaOk = await processMediaInBuffer();
-              if (!mediaOk) {
-                // 流式已降级，发送缓冲区中的剩余内容
-                const fallbackText = streamBuffer;
-                streamBuffer = "";
-                if (fallbackText) {
-                  await sendTextMessage(fallbackText);
-                }
+              // ---- 步骤 2: 责任链主动处理 ----
+              // 处理需要立即响应的特殊格式（QQBOT_PAYLOAD、完整媒体标签）
+              const ctx = buildHandlerContext();
+              const { handled } = await handlerChain.processBuffer(ctx);
+              streamBuffer = ctx.buffer;
+
+              // 如果 payload 被拦截（abort），直接返回
+              if (handled && pendingPayloadText) {
                 return;
               }
 
-              // 缓冲区中没有（或已处理完）媒体标签，按正常攒包逻辑发送纯文本
-              if (streamBuffer.length >= STREAM_MIN_FLUSH_CHARS) {
-                const safePoint = findSafeFlushPoint(streamBuffer);
-                if (safePoint > 0) {
-                  const toSend = streamBuffer.slice(0, safePoint);
-                  streamBuffer = streamBuffer.slice(safePoint);
-                  if (toSend) {
-                    const success = await sendStreamChunk(toSend, false);
-                    if (success) {
-                      streamStarted = true;
-                    } else {
-                      streamFailed = true;
-                      log?.error(`[qqbot:${account.accountId}] Stream send failed in onPartialReply, falling back`);
-                      const fallbackText = streamBuffer;
-                      streamBuffer = "";
-                      if (fallbackText) {
-                        await sendTextMessage(fallbackText);
-                      }
-                    }
+              // 如果流式已失败，停止发送
+              if (streamFailed) {
+                streamBuffer = "";
+                return;
+              }
+
+              // ---- 步骤 3 + 4: 判断能否发送 + 循环发送安全分片 ----
+              while (streamBuffer.length >= STREAM_MIN_FLUSH_CHARS) {
+                const safePoint = handlerChain.findSafeFlushPoint(streamBuffer);
+                if (safePoint <= 0) break; // 无安全点，继续攒
+
+                const toSend = streamBuffer.slice(0, safePoint);
+                streamBuffer = streamBuffer.slice(safePoint);
+
+                if (toSend) {
+                  const success = await sendStreamChunk(toSend, false);
+                  if (success) {
+                    streamStarted = true;
+                  } else {
+                    // 流式发送失败，停止当前消息发送
+                    streamFailed = true;
+                    log?.error(`[qqbot:${account.accountId}] Stream send failed in onPartialReply, stopping current message`);
+                    streamBuffer = "";
+                    return;
                   }
                 }
               }
@@ -2225,8 +2006,14 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   // 流式模式：文本→流式发送，公网图片→markdown嵌入流式，本地图片/语音/视频/文件→中断流式→发送→重建
                   // 非流式模式：文本→直接发送，图片/语音/视频/文件→直接发送
                   for (const item of sendQueue) {
+                    // 流式已失败，停止后续所有发送
+                    if (isStreaming && streamFailed) {
+                      log?.info(`[qqbot:${account.accountId}] Stream failed, skipping remaining ${sendQueue.indexOf(item) + 1}/${sendQueue.length} items`);
+                      break;
+                    }
+
                     if (item.type === "text") {
-                      if (isStreaming && !streamFailed) {
+                      if (isStreaming) {
                         await streamSendTextOrFallback(item.content);
                       } else {
                         try {
@@ -2241,7 +2028,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                       const isHttpUrl = imagePath.startsWith("http://") || imagePath.startsWith("https://");
                       const isLocalPath = isLocalFilePath(imagePath);
                       
-                      if (isStreaming && !streamFailed && isHttpUrl) {
+                      if (isStreaming && isHttpUrl) {
                         // 流式 + 公网 URL → markdown 图片格式嵌入流式（不中断）
                         try {
                           const size = await getImageSize(imagePath);
@@ -2253,12 +2040,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                           const mdImage = formatQQBotMarkdownImage(imagePath, null);
                           await streamSendTextOrFallback("\n" + mdImage + "\n");
                         }
-                      } else if (isStreaming && !streamFailed && isLocalPath) {
+                      } else if (isStreaming && isLocalPath) {
                         // 流式 + 本地图片 → 中断流式 → 富媒体 API → 重建
                         await interruptStream();
                         await sendMediaByType("image", item.content);
                         rebuildStream();
-                      } else if (!isStreaming || streamFailed) {
+                      } else if (!isStreaming) {
                         // 非流式模式：直接发送图片
                         if (isLocalPath) {
                           // 大文件进度提示
@@ -2278,11 +2065,11 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                       }
                     } else if (item.type === "voice" || item.type === "video" || item.type === "file") {
                       // 语音/视频/文件：流式模式下需中断→发送→重建
-                      if (isStreaming && !streamFailed) {
+                      if (isStreaming) {
                         await interruptStream();
                       }
                       // 非流式模式下，本地大文件进度提示
-                      if (!isStreaming || streamFailed) {
+                      if (!isStreaming) {
                         const mediaPath = normalizePath(item.content);
                         const isMediaHttp = mediaPath.startsWith("http://") || mediaPath.startsWith("https://");
                         if (!isMediaHttp) {
@@ -2296,14 +2083,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                         }
                       }
                       await sendMediaByType(item.type, item.content);
-                      if (isStreaming && !streamFailed) {
+                      if (isStreaming) {
                         rebuildStream();
                       }
-                    }
-                    
-                    // 如果流式已降级，后续循环中 isStreaming 条件自然不再满足
-                    if (isStreaming && streamFailed) {
-                      log?.info(`[qqbot:${account.accountId}] Stream failed during media processing, remaining items will use normal send`);
                     }
                   }
                   
@@ -2683,13 +2465,18 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             if (streamSender && !streamEnded && streamStarted) {
               // 安全刷新缓冲区（处理完整/不完整媒体标签）
               const pendingMedia = await flushStreamBufferSafe();
-              await streamSender.end("");
+              const endResult = await streamSender.end("");
+              if (endResult.error) {
+                log?.error(`[qqbot:${account.accountId}] Stream end failed: ${endResult.error}`);
+              }
               streamEnded = true;
               // 发送提取出的媒体（在流式结束后）
               for (const media of pendingMedia) {
                 await sendMediaByType(media.type, media.path);
               }
               log?.info(`[qqbot:${account.accountId}] Stream completed, total chunks: ${streamSender.getContext().index}`);
+            } else if (streamSender && !streamEnded) {
+              log?.info(`[qqbot:${account.accountId}] Stream not ended: streamStarted=${streamStarted}, streamFailed=${streamFailed}, buffer=${JSON.stringify(streamBuffer)}`);
             }
           } catch (err) {
             clearKeepalive();
