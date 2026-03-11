@@ -344,13 +344,26 @@ export function findMediaTagSafePoint(text: string): number {
     return len; // 完整标签，全部安全
   }
 
-  // 检查 2: 是否是不完整的开始标签
+  // 检查 2: 是否是不完整的开始标签或闭合标签
   // 匹配 "<", "<q", "<qq", "<qqi", "<qqim", "<qqimg", "<qqimg>",
   // "<qqv", "<qqvo", "<qqvoi", "<qqvoic", "<qqvoice", "<qqvoice>",
   // 等等，以及 "</", "</q", "</qq"...
   const incompleteOpenOrCloseTag = /^<\/?(?:q(?:q(?:i(?:m(?:g)?)?|v(?:o(?:i(?:c(?:e)?)?)?|i(?:d(?:e(?:o)?)?)?)?|f(?:i(?:l(?:e)?)?)?)?)?)?$/i;
   if (incompleteOpenOrCloseTag.test(tail)) {
-    // 不完整的标签名，在 '<' 之前截断
+    // 如果是不完整的闭合标签（以 "</" 开头），需要向前查找对应的开始标签
+    // 例如 buffer = "<qqvideo>url</" 时，安全点应在 "<qqvideo>" 之前，而非 "</" 之前
+    if (tail.startsWith("</")) {
+      const openTagPos = text.lastIndexOf('<', lastAngleBracket - 1);
+      if (openTagPos >= 0) {
+        const segment = text.slice(openTagPos);
+        const hasMatchingOpen = /^<(qqimg|qqvoice|qqvideo|qqfile)>/i.test(segment);
+        if (hasMatchingOpen) {
+          // 整个标签对未闭合，在开始标签的 '<' 前截断
+          return openTagPos;
+        }
+      }
+    }
+    // 不完整的开始标签，或闭合标签无对应开始标签，在 '<' 之前截断
     return lastAngleBracket;
   }
 

@@ -1858,6 +1858,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             // 检测缓冲区中是否有完整的媒体标签
             const regex = new RegExp(MEDIA_TAG_REGEX.source, MEDIA_TAG_REGEX.flags);
             const matches = [...streamBuffer.matchAll(regex)];
+            log?.info(`[qqbot:${account.accountId}] processMediaInBuffer: matches=${matches.length}, buffer=${JSON.stringify(streamBuffer)}`);
             if (matches.length === 0) return true;
 
             // 内联中断流式（不使用 interruptStream 避免死锁）
@@ -1948,6 +1949,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             // 3. 标签后的剩余文本留在缓冲区
             streamBuffer = streamBuffer.slice(lastIndex);
+            log?.info(`[qqbot:${account.accountId}] processMediaInBuffer: done, lastIndex=${lastIndex}, remaining buffer=${JSON.stringify(streamBuffer)}`);
             return true;
           };
 
@@ -1967,6 +1969,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
            */
           const flushStreamBufferSafe = async (): Promise<Array<{ type: string; path: string }>> => {
             const pendingMedia: Array<{ type: string; path: string }> = [];
+            log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: enter, buffer=${JSON.stringify(streamBuffer)}`);
             if (!streamBuffer) return pendingMedia;
 
             // 1. 处理完整的媒体标签（需要在 sendingLock 保护下调用）
@@ -1980,6 +1983,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               sendingLock = false;
             }
 
+            log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: after processMediaInBuffer, buffer=${JSON.stringify(streamBuffer)}`);
             if (!streamBuffer) return pendingMedia;
 
             // 2. 检测不完整的媒体标签（AI 没有输出闭合标签的情况）
@@ -2022,6 +2026,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             // 3. 发送剩余的纯文本
             if (streamBuffer) {
+              log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: sending remaining text, buffer=${JSON.stringify(streamBuffer)}`);
               await sendStreamChunk(streamBuffer, false);
               streamBuffer = "";
             }
