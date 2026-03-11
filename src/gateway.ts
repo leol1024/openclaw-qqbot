@@ -10,7 +10,7 @@ import { startImageServer, isImageServerRunning, downloadFile, type ImageServerC
 import { getImageSize, formatQQBotMarkdownImage, hasQQBotImageSize, DEFAULT_IMAGE_SIZE } from "./utils/image-size.js";
 import { parseQQBotPayload, encodePayloadForCron, isCronReminderPayload, isMediaPayload, type CronReminderPayload, type MediaPayload } from "./utils/payload.js";
 import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
-import { normalizeMediaTags, findMediaTagSafePoint, parseMediaTags, MEDIA_TAG_REGEX, decodeMediaPath, tagNameToQueueType, filterInternalMarkers } from "./utils/media-tags.js";
+import { normalizeMediaTags, findMediaTagSafePoint, parseMediaTags, MEDIA_TAG_REGEX, INCOMPLETE_MEDIA_TAG_REGEX, decodeMediaPath, tagNameToQueueType, filterInternalMarkers } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
 import { createStreamSender } from "./outbound.js";
@@ -1951,6 +1951,84 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             return true;
           };
 
+          /**
+           * 安全刷新 streamBuffer（处理完整标签 + 不完整标签 + 剩余纯文本）
+           * 
+           * 在所有需要强制刷新 streamBuffer 的场景使用（结束、中断、超时等），
+           * 避免将未处理的媒体标签作为纯文本发送。
+           * 
+           * 处理流程：
+           *   1. processMediaInBuffer() 处理完整标签（<qqvideo>url</qqvideo>）
+           *   2. 检测不完整标签（只有 <qqvideo>url 没有 </qqvideo>），
+           *      提取标签前文本 → 流式发送，媒体内容记入 pendingMedia 待后续处理
+           *   3. 剩余纯文本通过 sendStreamChunk 发送
+           * 
+           * @returns 提取出的待发送媒体列表（调用者在流式结束后独立发送）
+           */
+          const flushStreamBufferSafe = async (): Promise<Array<{ type: string; path: string }>> => {
+            const pendingMedia: Array<{ type: string; path: string }> = [];
+            if (!streamBuffer) return pendingMedia;
+
+            // 1. 处理完整的媒体标签（需要在 sendingLock 保护下调用）
+            while (sendingLock) {
+              await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            sendingLock = true;
+            try {
+              await processMediaInBuffer();
+            } finally {
+              sendingLock = false;
+            }
+
+            if (!streamBuffer) return pendingMedia;
+
+            // 2. 检测不完整的媒体标签（AI 没有输出闭合标签的情况）
+            streamBuffer = normalizeMediaTags(streamBuffer);
+            const incompleteRegex = new RegExp(INCOMPLETE_MEDIA_TAG_REGEX.source, INCOMPLETE_MEDIA_TAG_REGEX.flags);
+            const incompleteMatches = [...streamBuffer.matchAll(incompleteRegex)];
+
+            if (incompleteMatches.length > 0) {
+              log?.info(`[qqbot:${account.accountId}] Found ${incompleteMatches.length} incomplete media tag(s) in buffer, processing`);
+
+              let lastIndex = 0;
+              for (const match of incompleteMatches) {
+                // 发送标签前的纯文本
+                const textBefore = streamBuffer.slice(lastIndex, match.index);
+                if (textBefore.trim()) {
+                  const filteredText = filterInternalMarkers(textBefore);
+                  if (filteredText) {
+                    await sendStreamChunk(filteredText, false);
+                    streamStarted = true;
+                  }
+                }
+
+                // 提取媒体标签信息，待调用者在流式结束后发送
+                const tagName = match[1]!.toLowerCase();
+                const rawPath = match[2] ?? "";
+                const mediaPath = decodeMediaPath(rawPath.trim());
+
+                if (mediaPath) {
+                  const mediaType = tagNameToQueueType(tagName);
+                  log?.info(`[qqbot:${account.accountId}] Extracted incomplete ${mediaType} tag for post-stream send: ${mediaPath.slice(0, 120)}`);
+                  pendingMedia.push({ type: mediaType, path: mediaPath });
+                }
+
+                lastIndex = match.index! + match[0].length;
+              }
+
+              // 标签后的剩余文本（不完整标签匹配到末尾，通常没有剩余）
+              streamBuffer = streamBuffer.slice(lastIndex);
+            }
+
+            // 3. 发送剩余的纯文本
+            if (streamBuffer) {
+              await sendStreamChunk(streamBuffer, false);
+              streamBuffer = "";
+            }
+
+            return pendingMedia;
+          };
+
           const handlePartialReply = supportsStream ? async (payload: { text?: string }) => {
             if (!streamSender || streamEnded || streamFailed) return;
 
@@ -1977,6 +2055,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             // 计算增量文本
             const delta = fullText.slice(partialReplySentLength);
+            log?.info(`[qqbot:${account.accountId}] handlePartialReply: fullLen=${fullText.length}, sentLen=${partialReplySentLength}, delta=${JSON.stringify(delta)}, buffer=${JSON.stringify(streamBuffer)}, fullText=${JSON.stringify(fullText)}`);
             partialReplySentLength = fullText.length;
 
             // 将增量加入攒包缓冲区
@@ -2490,16 +2569,14 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                 // 如果在流式模式中出错，发送结束标记
                 if (streamSender && !streamEnded && streamStarted) {
                   try {
-                    while (sendingLock) {
-                      await new Promise(resolve => setTimeout(resolve, 50));
-                    }
-                    // 刷新攒包缓冲区
-                    if (streamBuffer) {
-                      await sendStreamChunk(streamBuffer, false);
-                      streamBuffer = "";
-                    }
+                    // 安全刷新缓冲区（处理完整/不完整媒体标签）
+                    const pendingMedia = await flushStreamBufferSafe();
                     await streamSender.end("\n\n[生成中断]");
                     streamEnded = true;
+                    // 发送提取出的媒体（在流式结束后）
+                    for (const media of pendingMedia) {
+                      await sendMediaByType(media.type, media.path);
+                    }
                     log?.info(`[qqbot:${account.accountId}] Stream ended due to error`);
                   } catch (endErr) {
                     log?.error(`[qqbot:${account.accountId}] Failed to end stream: ${endErr}`);
@@ -2532,17 +2609,15 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               onAssistantMessageStart: supportsStream ? async () => {
                 if (streamStarted && !streamEnded && streamSender) {
                   log?.info(`[qqbot:${account.accountId}] onAssistantMessageStart: ending current stream for new message`);
-                  while (sendingLock) {
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                  }
                   try {
-                    // 刷新攒包缓冲区
-                    if (streamBuffer) {
-                      await sendStreamChunk(streamBuffer, false);
-                      streamBuffer = "";
-                    }
+                    // 安全刷新缓冲区（处理完整/不完整媒体标签）
+                    const pendingMedia = await flushStreamBufferSafe();
                     await streamSender.end("");
                     streamEnded = true;
+                    // 发送提取出的媒体（在流式结束后）
+                    for (const media of pendingMedia) {
+                      await sendMediaByType(media.type, media.path);
+                    }
                     // 重置 partialReplySentLength，新消息的 onPartialReply 累积文本从零开始
                     partialReplySentLength = 0;
                     pendingPayloadText = ""; // 重置 payload 暂存
@@ -2578,15 +2653,14 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               
               // 先结束当前流式（如果已启动）
               if (streamStarted && !streamEnded) {
-                while (sendingLock) {
-                  await new Promise(resolve => setTimeout(resolve, 50));
-                }
-                if (streamBuffer) {
-                  await sendStreamChunk(streamBuffer, false);
-                  streamBuffer = "";
-                }
+                // 安全刷新缓冲区（处理完整/不完整媒体标签）
+                const pendingMedia = await flushStreamBufferSafe();
                 await streamSender.end("");
                 streamEnded = true;
+                // 发送提取出的媒体
+                for (const media of pendingMedia) {
+                  await sendMediaByType(media.type, media.path);
+                }
               }
               
               // 处理暂存的 payload（调用公共函数）
@@ -2602,16 +2676,14 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             
             // 分发完成后，如果使用了流式且有内容，发送结束标记
             if (streamSender && !streamEnded && streamStarted) {
-              while (sendingLock) {
-                await new Promise(resolve => setTimeout(resolve, 50));
-              }
-              // 先刷新攒包缓冲区中的剩余内容
-              if (streamBuffer) {
-                await sendStreamChunk(streamBuffer, false);
-                streamBuffer = "";
-              }
+              // 安全刷新缓冲区（处理完整/不完整媒体标签）
+              const pendingMedia = await flushStreamBufferSafe();
               await streamSender.end("");
               streamEnded = true;
+              // 发送提取出的媒体（在流式结束后）
+              for (const media of pendingMedia) {
+                await sendMediaByType(media.type, media.path);
+              }
               log?.info(`[qqbot:${account.accountId}] Stream completed, total chunks: ${streamSender.getContext().index}`);
             }
           } catch (err) {
@@ -2622,16 +2694,14 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             // 流式结束处理（超时场景）
             if (streamSender && !streamEnded && streamStarted) {
               try {
-                while (sendingLock) {
-                  await new Promise(resolve => setTimeout(resolve, 50));
-                }
-                // 刷新攒包缓冲区
-                if (streamBuffer) {
-                  await sendStreamChunk(streamBuffer, false);
-                  streamBuffer = "";
-                }
+                // 安全刷新缓冲区（处理完整/不完整媒体标签）
+                const pendingMedia = await flushStreamBufferSafe();
                 await streamSender.end("\n\n[超时]");
                 streamEnded = true;
+                // 发送提取出的媒体（在流式结束后）
+                for (const media of pendingMedia) {
+                  await sendMediaByType(media.type, media.path);
+                }
               } catch {}
             }
             if (!hasResponse) {

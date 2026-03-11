@@ -143,6 +143,13 @@ export function normalizeMediaTags(text: string): string {
 /** 媒体标签正则（标准化后的格式） */
 export const MEDIA_TAG_REGEX = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
 
+/**
+ * 不完整媒体标签正则（只有开始标签，没有闭合标签）
+ * 匹配 <qqvideo>url 或 <qqimg>path 等，内容到文本末尾
+ * 用于流式结束阶段，AI 输出了开始标签但没有闭合标签的情况
+ */
+export const INCOMPLETE_MEDIA_TAG_REGEX = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)$/gi;
+
 /** 发送队列项类型 */
 export type MediaSendQueueItemType = "text" | "image" | "voice" | "video" | "file";
 
