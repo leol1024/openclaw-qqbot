@@ -41,6 +41,8 @@
   "scripts": {
     "build": "tsc || true",
     "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepack": "npm install --omit=dev"
   },
   "dependencies": {
@@ -57,7 +59,8 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/ws": "^8.5.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
   },
   "peerDependencies": {
     "clawdbot": "*",

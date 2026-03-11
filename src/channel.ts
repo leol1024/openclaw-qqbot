@@ -8,7 +8,7 @@ import {
 
 import type { ResolvedQQBotAccount } from "./types.js";
 import { DEFAULT_ACCOUNT_ID, listQQBotAccountIds, resolveQQBotAccount, applyQQBotAccountConfig, resolveDefaultQQBotAccountId } from "./config.js";
-import { sendText, sendMedia } from "./outbound.js";
+import { sendText, sendMedia, createStreamSender, StreamSender } from "./outbound.js";
 import { startGateway } from "./gateway.js";
 import { qqbotOnboardingAdapter } from "./onboarding.js";
 import { getQQBotRuntime } from "./runtime.js";
@@ -62,11 +62,21 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
     media: true,
     reactions: false,
     threads: false,
-    /**
-     * blockStreaming: true 表示该 Channel 支持块流式
-     * 框架会收集流式响应，然后通过 deliver 回调发送
-     */
-    blockStreaming: false,
+    blockStreaming: true,
+  },
+  /**
+   * 流式配置
+   * blockStreamingCoalesceDefaults: 控制 block streaming 的合并策略
+   *   - minChars: 至少累积多少字符后才触发 block deliver
+   *   - idleMs: 空闲多少毫秒后强制 flush 当前 block
+   *
+   * 对于 QQ Bot：
+   *   - C2C 私聊（streamSupport=true）通过 deliver 回调中的 StreamSender 实现增量流式
+   *     disableBlockStreaming=true，不走 coalesce
+   *   - 群聊/频道（或 C2C streamSupport=false）走框架的 block streaming pipeline，使用此 coalesce 配置
+   */
+  streaming: {
+    blockStreamingCoalesceDefaults: { minChars: 800, idleMs: 800 },
   },
   reload: { configPrefixes: ["channels.qqbot"] },
   // CLI onboarding wizard
@@ -366,3 +376,8 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
     }),
   },
 };
+
+/**
+ * 导出流式消息工具函数，供外部使用（仅 C2C 私聊支持）
+ */
+export { createStreamSender, StreamSender };

@@ -3,7 +3,8 @@
  */
 
 import * as path from "path";
-import type { ResolvedQQBotAccount } from "./types.js";
+import type { ResolvedQQBotAccount, StreamContext } from "./types.js";
+import { StreamState } from "./types.js";
 import { decodeCronPayload } from "./utils/payload.js";
 import {
   getAccessToken, 
@@ -20,9 +21,10 @@ import {
   sendGroupVideoMessage,
   sendC2CFileMessage,
   sendGroupFileMessage,
+  type MessageResponse,
 } from "./api.js";
 import { isAudioFile, audioFileToSilkBase64, waitForFile } from "./utils/audio-convert.js";
-import { normalizeMediaTags } from "./utils/media-tags.js";
+import { normalizeMediaTags, parseMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName } from "./utils/platform.js";
 
@@ -170,6 +172,8 @@ export interface OutboundResult {
   messageId?: string;
   timestamp?: string | number;
   error?: string;
+  /** 流式消息ID，用于后续分片 */
+  streamId?: string;
 }
 
 /**
@@ -272,7 +276,7 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
     }
   }
 
-  // ============ 媒体标签检测与处理 ============
+  // ============ 媒体标签检测与处理（使用共享的 parseMediaTags） ============
   // 支持四种标签:
   //   <qqimg>路径</qqimg> 或 <qqimg>路径</img>  — 图片
   //   <qqvoice>路径</qqvoice>                   — 语音
@@ -282,102 +286,10 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   // 预处理：纠正小模型常见的标签拼写错误和格式问题
   text = normalizeMediaTags(text);
   
-  const mediaTagRegex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
-  const mediaTagMatches = text.match(mediaTagRegex);
+  const { hasMedia, sendQueue } = parseMediaTags(text);
   
-  if (mediaTagMatches && mediaTagMatches.length > 0) {
-    console.log(`[qqbot] sendText: Detected ${mediaTagMatches.length} media tag(s), processing...`);
-    
-    // 构建发送队列：根据内容在原文中的实际位置顺序发送
-    const sendQueue: Array<{ type: "text" | "image" | "voice" | "video" | "file"; content: string }> = [];
-    
-    let lastIndex = 0;
-    const mediaTagRegexWithIndex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
-    let match;
-    
-    while ((match = mediaTagRegexWithIndex.exec(text)) !== null) {
-      // 添加标签前的文本
-      const textBefore = text.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n").trim();
-      if (textBefore) {
-        sendQueue.push({ type: "text", content: textBefore });
-      }
-      
-      const tagName = match[1]!.toLowerCase(); // "qqimg" or "qqvoice" or "qqfile"
-      
-      // 剥离 MEDIA: 前缀（框架可能注入），展开 ~ 路径
-      let mediaPath = match[2]?.trim() ?? "";
-      if (mediaPath.startsWith("MEDIA:")) {
-        mediaPath = mediaPath.slice("MEDIA:".length);
-      }
-      mediaPath = normalizePath(mediaPath);
-
-      // 处理可能被模型转义的路径
-      // 1. 双反斜杠 -> 单反斜杠（Markdown 转义）
-      mediaPath = mediaPath.replace(/\\\\/g, "\\");
-
-      // 2. 八进制转义序列 + UTF-8 双重编码修复
-      try {
-        const hasOctal = /\\[0-7]{1,3}/.test(mediaPath);
-        const hasNonASCII = /[\u0080-\u00FF]/.test(mediaPath);
-
-        if (hasOctal || hasNonASCII) {
-          console.log(`[qqbot] sendText: Decoding path with mixed encoding: ${mediaPath}`);
-
-          // Step 1: 将八进制转义转换为字节
-          let decoded = mediaPath.replace(/\\([0-7]{1,3})/g, (_: string, octal: string) => {
-            return String.fromCharCode(parseInt(octal, 8));
-          });
-
-          // Step 2: 提取所有字节（包括 Latin-1 字符）
-          const bytes: number[] = [];
-          for (let i = 0; i < decoded.length; i++) {
-            const code = decoded.charCodeAt(i);
-            if (code <= 0xFF) {
-              bytes.push(code);
-            } else {
-              const charBytes = Buffer.from(decoded[i], 'utf8');
-              bytes.push(...charBytes);
-            }
-          }
-
-          // Step 3: 尝试按 UTF-8 解码
-          const buffer = Buffer.from(bytes);
-          const utf8Decoded = buffer.toString('utf8');
-
-          if (!utf8Decoded.includes('\uFFFD') || utf8Decoded.length < decoded.length) {
-            mediaPath = utf8Decoded;
-            console.log(`[qqbot] sendText: Successfully decoded path: ${mediaPath}`);
-          }
-        }
-      } catch (decodeErr) {
-        console.error(`[qqbot] sendText: Path decode error: ${decodeErr}`);
-      }
-
-      if (mediaPath) {
-        if (tagName === "qqvoice") {
-          sendQueue.push({ type: "voice", content: mediaPath });
-          console.log(`[qqbot] sendText: Found voice path in <qqvoice>: ${mediaPath}`);
-        } else if (tagName === "qqvideo") {
-          sendQueue.push({ type: "video", content: mediaPath });
-          console.log(`[qqbot] sendText: Found video URL in <qqvideo>: ${mediaPath}`);
-        } else if (tagName === "qqfile") {
-          sendQueue.push({ type: "file", content: mediaPath });
-          console.log(`[qqbot] sendText: Found file path in <qqfile>: ${mediaPath}`);
-        } else {
-          sendQueue.push({ type: "image", content: mediaPath });
-          console.log(`[qqbot] sendText: Found image path in <qqimg>: ${mediaPath}`);
-        }
-      }
-      
-      lastIndex = match.index + match[0].length;
-    }
-    
-    // 添加最后一个标签后的文本
-    const textAfter = text.slice(lastIndex).replace(/\n{3,}/g, "\n\n").trim();
-    if (textAfter) {
-      sendQueue.push({ type: "text", content: textAfter });
-    }
-    
+  if (hasMedia) {
+    console.log(`[qqbot] sendText: Detected ${sendQueue.filter(i => i.type !== "text").length} media tag(s), processing...`);
     console.log(`[qqbot] sendText: Send queue: ${sendQueue.map(item => item.type).join(" -> ")}`);
     
     // 按顺序发送
@@ -1298,4 +1210,183 @@ export async function sendCronMessage(
   // 非结构化载荷，作为普通文本处理
   console.log(`[${timestamp}] [qqbot] sendCronMessage: plain text message, sending to ${to}`);
   return await sendProactiveMessage(account, to, message);
+}
+
+// ============ 流式消息发送（仅 C2C 私聊） ============
+
+/**
+ * 流式消息发送器
+ * 用于管理一个完整的流式消息会话（仅支持 C2C 私聊）
+ * 
+ * 群聊和频道不支持流式消息，会降级为普通消息发送。
+ */
+export class StreamSender {
+  private context: StreamContext;
+  private accessToken: string | null = null;
+  private targetType: "c2c" | "group" | "channel";
+  private targetId: string;
+  private msgId?: string;
+  private account: ResolvedQQBotAccount;
+
+  constructor(
+    account: ResolvedQQBotAccount,
+    to: string,
+    replyToId?: string | null
+  ) {
+    this.account = account;
+    this.msgId = replyToId ?? undefined;
+    this.context = {
+      index: 0,
+      streamId: "",
+      ended: false,
+    };
+
+    // 解析目标地址
+    const target = parseTarget(to);
+    this.targetType = target.type;
+    this.targetId = target.id;
+  }
+
+  /**
+   * 发送流式消息分片
+   * @param text 分片内容（累积的完整文本）
+   * @param isEnd 是否是最后一个分片
+   * @returns 发送结果
+   */
+  async send(text: string, isEnd = false): Promise<OutboundResult> {
+    if (this.context.ended) {
+      return { channel: "qqbot", error: "Stream already ended" };
+    }
+
+    if (!this.account.appId || !this.account.clientSecret) {
+      return { channel: "qqbot", error: "QQBot not configured (missing appId or clientSecret)" };
+    }
+
+    try {
+      // 获取或复用 accessToken
+      if (!this.accessToken) {
+        this.accessToken = await getAccessToken(this.account.appId, this.account.clientSecret);
+      }
+
+      // 仅 C2C 支持流式
+      if (this.targetType === "c2c") {
+        const streamConfig = {
+          state: isEnd ? StreamState.END : StreamState.STREAMING,
+          index: this.context.index,
+          id: this.context.streamId,
+        };
+
+        const result: MessageResponse = await sendC2CMessage(
+          this.accessToken,
+          this.targetId,
+          text,
+          this.msgId,
+          streamConfig
+        );
+
+        // 更新流式上下文
+        // 第一次发送后，服务端会返回 stream_id，后续需要带上
+        if (this.context.index === 0 && result.stream_id) {
+          this.context.streamId = result.stream_id;
+        } else if (this.context.index === 0 && result.id && !this.context.streamId) {
+          // 某些情况下 stream_id 可能在 id 字段返回
+          this.context.streamId = result.id;
+        }
+
+        this.context.index++;
+
+        if (isEnd) {
+          this.context.ended = true;
+        }
+
+        // 记录被动回复次数（仅首次分片计入限流）
+        if (this.context.index === 1 && this.msgId) {
+          recordMessageReply(this.msgId);
+        }
+
+        return { 
+          channel: "qqbot", 
+          messageId: result.id, 
+          timestamp: result.timestamp,
+          streamId: this.context.streamId,
+        };
+      } else if (this.targetType === "group") {
+        // 群聊不支持流式，降级为普通消息
+        const groupResult = await sendGroupMessage(
+          this.accessToken,
+          this.targetId,
+          text,
+          this.msgId
+        );
+        if (isEnd) {
+          this.context.ended = true;
+        }
+        return { 
+          channel: "qqbot", 
+          messageId: groupResult.id, 
+          timestamp: groupResult.timestamp 
+        };
+      } else {
+        // 频道不支持流式，降级为普通消息
+        const channelResult = await sendChannelMessage(
+          this.accessToken,
+          this.targetId,
+          text,
+          this.msgId
+        );
+        if (isEnd) {
+          this.context.ended = true;
+        }
+        return { 
+          channel: "qqbot", 
+          messageId: channelResult.id, 
+          timestamp: channelResult.timestamp 
+        };
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { channel: "qqbot", error: message };
+    }
+  }
+
+  /**
+   * 结束流式消息
+   * @param text 最后一个分片的内容（可选）
+   */
+  async end(text?: string): Promise<OutboundResult> {
+    return this.send(text ?? "", true);
+  }
+
+  /**
+   * 获取当前流式上下文状态
+   */
+  getContext(): Readonly<StreamContext> {
+    return { ...this.context };
+  }
+
+  /**
+   * 是否已结束
+   */
+  isEnded(): boolean {
+    return this.context.ended;
+  }
+
+  /**
+   * 是否支持流式（仅 C2C 支持）
+   */
+  isStreamSupported(): boolean {
+    return this.targetType === "c2c";
+  }
+}
+
+/**
+ * 创建流式消息发送器
+ * 提供更细粒度的控制（仅 C2C 私聊支持真正的流式消息）
+ */
+export function createStreamSender(
+  account: ResolvedQQBotAccount,
+  to: string,
+  replyToId?: string | null
+): StreamSender {
+  return new StreamSender(account, to, replyToId);
 }

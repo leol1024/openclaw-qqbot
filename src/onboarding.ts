@@ -22,6 +22,7 @@ interface QQBotChannelConfig {
   name?: string;
   imageServerBaseUrl?: string;
   markdownSupport?: boolean;
+  streamSupport?: boolean;
   allowFrom?: string[];
   accounts?: Record<string, {
     enabled?: boolean;
@@ -31,6 +32,7 @@ interface QQBotChannelConfig {
     name?: string;
     imageServerBaseUrl?: string;
     markdownSupport?: boolean;
+    streamSupport?: boolean;
     allowFrom?: string[];
   }>;
 }
@@ -208,11 +210,13 @@ statusLines: [`QQ Bot: ${configured ? "已配置" : "需要 AppID 和 ClientSecr
     // 默认允许所有人执行命令（用户无感知）
     const allowFrom: string[] = resolvedAccount.config?.allowFrom ?? ["*"];
 
-    // 应用配置（markdownSupport 默认开启，如需关闭可用 set-markdown.sh）
+    // 应用配置（markdownSupport 默认开启，streamSupport 默认关闭）
     if (appId && clientSecret) {
       const existingQQBot = (next.channels?.qqbot as Record<string, unknown>) || {};
       // 保留已有的 markdownSupport 设置，新装默认 true
       const markdownSupport = existingQQBot.markdownSupport ?? true;
+      // 保留已有的 streamSupport 设置，新装默认 false（需要用户主动开启）
+      const streamSupport = existingQQBot.streamSupport ?? false;
 
       if (accountId === DEFAULT_ACCOUNT_ID) {
         next = {
@@ -225,6 +229,7 @@ statusLines: [`QQ Bot: ${configured ? "已配置" : "需要 AppID 和 ClientSecr
               appId,
               clientSecret,
               markdownSupport,
+              streamSupport,
               allowFrom,
             },
           },
@@ -233,6 +238,7 @@ statusLines: [`QQ Bot: ${configured ? "已配置" : "需要 AppID 和 ClientSecr
         const existingAccounts = ((next.channels?.qqbot as QQBotChannelConfig)?.accounts || {});
         const existingAccount = existingAccounts[accountId] || {};
         const acctMarkdown = existingAccount.markdownSupport ?? true;
+        const acctStream = existingAccount.streamSupport ?? false;
 
         next = {
           ...next,
@@ -249,6 +255,7 @@ statusLines: [`QQ Bot: ${configured ? "已配置" : "需要 AppID 和 ClientSecr
                   appId,
                   clientSecret,
                   markdownSupport: acctMarkdown,
+                  streamSupport: acctStream,
                   allowFrom,
                 },
               },

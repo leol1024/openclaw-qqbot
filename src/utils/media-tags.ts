@@ -1,10 +1,15 @@
 /**
- * 富媒体标签预处理与纠错
+ * 富媒体标签预处理、纠错、解析
  *
- * 小模型常见的标签拼写错误及变体，在正则匹配前统一修正为标准格式。
+ * 1. normalizeMediaTags: 小模型常见的标签拼写错误及变体修正
+ * 2. parseMediaTags: 将文本解析为发送队列（文本/图片/语音/视频/文件）
+ * 3. hasIncompleteMediaTag: 检测文本末尾是否存在不完整的媒体标签
+ *
+ * 设计原则：sendText（outbound.ts）和 deliver 回调（gateway.ts）
+ * 共享同一套解析逻辑，避免重复维护。
  */
 
-import { expandTilde } from "./platform.js";
+import { expandTilde, normalizePath } from "./platform.js";
 
 // 标准标签名
 const VALID_TAGS = ["qqimg", "qqvoice", "qqvideo", "qqfile"] as const;
@@ -131,4 +136,247 @@ export function normalizeMediaTags(text: string): string {
     const expanded = expandTilde(trimmed);
     return `<${tag}>${expanded}</${tag}>`;
   });
+}
+
+// ============ 共享的媒体标签解析逻辑 ============
+
+/** 媒体标签正则（标准化后的格式） */
+export const MEDIA_TAG_REGEX = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
+
+/** 发送队列项类型 */
+export type MediaSendQueueItemType = "text" | "image" | "voice" | "video" | "file";
+
+/** 发送队列项 */
+export interface MediaSendQueueItem {
+  type: MediaSendQueueItemType;
+  content: string;
+}
+
+/**
+ * 解码模型输出中可能存在的转义路径
+ *
+ * 处理：
+ *   1. 双反斜杠 → 单反斜杠（Markdown 转义）
+ *   2. 八进制转义序列 + UTF-8 双重编码修复
+ *
+ * sendText 和 deliver 回调中都需要这段逻辑，提取为共享函数。
+ */
+export function decodeMediaPath(rawPath: string): string {
+  // 剥离 MEDIA: 前缀（框架可能注入），展开 ~ 路径
+  let mediaPath = rawPath.trim();
+  if (mediaPath.startsWith("MEDIA:")) {
+    mediaPath = mediaPath.slice("MEDIA:".length);
+  }
+  mediaPath = normalizePath(mediaPath);
+
+  // 1. 双反斜杠 -> 单反斜杠（Markdown 转义）
+  mediaPath = mediaPath.replace(/\\\\/g, "\\");
+
+  // 2. 八进制转义序列 + UTF-8 双重编码修复
+  try {
+    const hasOctal = /\\[0-7]{1,3}/.test(mediaPath);
+    const hasNonASCII = /[\u0080-\u00FF]/.test(mediaPath);
+
+    if (hasOctal || hasNonASCII) {
+      // Step 1: 将八进制转义转换为字节
+      let decoded = mediaPath.replace(/\\([0-7]{1,3})/g, (_: string, octal: string) => {
+        return String.fromCharCode(parseInt(octal, 8));
+      });
+
+      // Step 2: 提取所有字节（包括 Latin-1 字符）
+      const bytes: number[] = [];
+      for (let i = 0; i < decoded.length; i++) {
+        const code = decoded.charCodeAt(i);
+        if (code <= 0xFF) {
+          bytes.push(code);
+        } else {
+          const charBytes = Buffer.from(decoded[i]!, 'utf8');
+          bytes.push(...charBytes);
+        }
+      }
+
+      // Step 3: 尝试按 UTF-8 解码
+      const buffer = Buffer.from(bytes);
+      const utf8Decoded = buffer.toString('utf8');
+
+      if (!utf8Decoded.includes('\uFFFD') || utf8Decoded.length < decoded.length) {
+        mediaPath = utf8Decoded;
+      }
+    }
+  } catch {
+    // 路径解码失败，使用原始路径
+  }
+
+  return mediaPath;
+}
+
+/** 标签名 → 发送队列项类型 */
+function tagNameToQueueType(tagName: string): MediaSendQueueItemType {
+  switch (tagName) {
+    case "qqvoice": return "voice";
+    case "qqvideo": return "video";
+    case "qqfile": return "file";
+    default: return "image";
+  }
+}
+
+/**
+ * 解析文本中的媒体标签，生成发送队列
+ *
+ * 支持四种标签:
+ *   <qqimg>路径</qqimg>     — 图片
+ *   <qqvoice>路径</qqvoice> — 语音
+ *   <qqvideo>路径</qqvideo> — 视频
+ *   <qqfile>路径</qqfile>   — 文件
+ *
+ * 按文本中出现的位置构建发送队列，保持顺序。
+ *
+ * @param text 已经过 normalizeMediaTags 预处理的文本
+ * @param textFilter 可选的文本过滤函数（如 filterInternalMarkers），对文本部分进行处理
+ * @returns { hasMedia: boolean, sendQueue: MediaSendQueueItem[] }
+ *   - hasMedia: 是否包含媒体标签
+ *   - sendQueue: 发送队列（如果没有媒体标签，为空数组）
+ */
+export function parseMediaTags(
+  text: string,
+  textFilter?: (text: string) => string
+): { hasMedia: boolean; sendQueue: MediaSendQueueItem[] } {
+  const regex = new RegExp(MEDIA_TAG_REGEX.source, MEDIA_TAG_REGEX.flags);
+  const matches = [...text.matchAll(regex)];
+
+  if (matches.length === 0) {
+    return { hasMedia: false, sendQueue: [] };
+  }
+
+  const sendQueue: MediaSendQueueItem[] = [];
+  let lastIndex = 0;
+
+  for (const match of matches) {
+    // 添加标签前的文本
+    const textBefore = text.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n").trim();
+    if (textBefore) {
+      const filtered = textFilter ? textFilter(textBefore) : textBefore;
+      if (filtered) {
+        sendQueue.push({ type: "text", content: filtered });
+      }
+    }
+
+    const tagName = match[1]!.toLowerCase();
+    const rawPath = match[2] ?? "";
+    const mediaPath = decodeMediaPath(rawPath);
+
+    if (mediaPath) {
+      sendQueue.push({ type: tagNameToQueueType(tagName), content: mediaPath });
+    }
+
+    lastIndex = match.index! + match[0].length;
+  }
+
+  // 添加最后一个标签后的文本
+  const textAfter = text.slice(lastIndex).replace(/\n{3,}/g, "\n\n").trim();
+  if (textAfter) {
+    const filtered = textFilter ? textFilter(textAfter) : textAfter;
+    if (filtered) {
+      sendQueue.push({ type: "text", content: filtered });
+    }
+  }
+
+  return { hasMedia: true, sendQueue };
+}
+
+// ============ 流式攒包：媒体标签完整性检测 ============
+
+/**
+ * 检测文本末尾是否存在不完整的媒体标签
+ *
+ * 流式场景下，AI 输出的 <qqimg>path</qqimg> 标签可能被截断在：
+ *   1. 开始标签中间：  "<qq" / "<qqim" / "<qqimg" / "<qqimg>"
+ *   2. 标签内容中间：  "<qqimg>/path/to/fi"
+ *   3. 结束标签中间：  "<qqimg>/path</qq" / "<qqimg>/path</"
+ *
+ * 如果在这些位置截断发送，QQ API 会收到含有不完整标签的文本，
+ * 后续拼接时会格式错乱。
+ *
+ * @param text 待检测的文本
+ * @returns 安全截断位置（从该位置截断发送，之后的内容留在缓冲区）
+ *          返回 text.length 表示全部安全
+ */
+export function findMediaTagSafePoint(text: string): number {
+  const len = text.length;
+  if (len === 0) return 0;
+
+  // 策略：从文本末尾向前搜索，找到最后一个 '<' 字符，
+  // 判断它是否是一个不完整的媒体标签的开始
+
+  // 最大回溯范围（媒体标签最长不会超过这个长度）
+  // <qqvideo>很长的路径最多2048字符</qqvideo> ≈ 2080
+  const MAX_SCAN = Math.min(len, 2100);
+  const searchStart = len - MAX_SCAN;
+
+  // 从后向前找最后一个 '<'
+  let lastAngleBracket = -1;
+  for (let i = len - 1; i >= searchStart; i--) {
+    if (text[i] === '<') {
+      lastAngleBracket = i;
+      break;
+    }
+  }
+
+  if (lastAngleBracket < 0) {
+    // 没有 '<'，全部安全
+    return len;
+  }
+
+  // 从 lastAngleBracket 开始到末尾的文本
+  const tail = text.slice(lastAngleBracket);
+
+  // 检查 1: 完整的标签对（已闭合）
+  // 如果末尾有完整的 <qqXXX>...</qqXXX>，那就是安全的
+  const completeTagRegex = /^<(qqimg|qqvoice|qqvideo|qqfile)>[^<>]+<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>$/i;
+  if (completeTagRegex.test(tail)) {
+    return len; // 完整标签，全部安全
+  }
+
+  // 检查 2: 是否是不完整的开始标签
+  // 匹配 "<", "<q", "<qq", "<qqi", "<qqim", "<qqimg", "<qqimg>",
+  // "<qqv", "<qqvo", "<qqvoi", "<qqvoic", "<qqvoice", "<qqvoice>",
+  // 等等，以及 "</", "</q", "</qq"...
+  const incompleteOpenOrCloseTag = /^<\/?(?:q(?:q(?:i(?:m(?:g)?)?|v(?:o(?:i(?:c(?:e)?)?)?|i(?:d(?:e(?:o)?)?)?)?|f(?:i(?:l(?:e)?)?)?)?)?)?$/i;
+  if (incompleteOpenOrCloseTag.test(tail)) {
+    // 不完整的标签名，在 '<' 之前截断
+    return lastAngleBracket;
+  }
+
+  // 检查 3: 有完整的开始标签 <qqXXX> 但没有闭合
+  // e.g. "<qqimg>/path/to/file" 或 "<qqimg>/path</qq"
+  const hasOpenTag = /^<(qqimg|qqvoice|qqvideo|qqfile)>/i.test(tail);
+  if (hasOpenTag) {
+    // 有开始标签但尾部没有完整的闭合标签 → 不完整
+    const closeTagRegex = /<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/i;
+    if (!closeTagRegex.test(tail)) {
+      // 整个标签未闭合，在 '<' 前截断
+      return lastAngleBracket;
+    }
+  }
+
+  // 检查 4: 闭合标签中间被截断
+  // e.g. "some text</qq" 或 "text</" 
+  const incompleteCloseInText = /<\/(?:q(?:q(?:i(?:m(?:g)?)?|v(?:o(?:i(?:c(?:e)?)?)?|i(?:d(?:e(?:o)?)?)?)?|f(?:i(?:l(?:e)?)?)?)?)?)?$/i;
+  if (incompleteCloseInText.test(tail)) {
+    // 向前找匹配的开始标签
+    const openTagPos = text.lastIndexOf('<', lastAngleBracket - 1);
+    if (openTagPos >= 0) {
+      const segment = text.slice(openTagPos);
+      const hasMatchingOpen = /^<(qqimg|qqvoice|qqvideo|qqfile)>/i.test(segment);
+      if (hasMatchingOpen) {
+        // 整个标签对未闭合，在开始标签的 '<' 前截断
+        return openTagPos;
+      }
+    }
+    // 仅闭合标签不完整，在 '<' 前截断
+    return lastAngleBracket;
+  }
+
+  // 全部安全
+  return len;
 }

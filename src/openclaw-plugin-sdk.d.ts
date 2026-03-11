@@ -324,6 +324,16 @@ declare module "openclaw/plugin-sdk" {
   }
 
   /**
+   * 流式配置
+   */
+  export interface ChannelStreamingConfig {
+    blockStreamingCoalesceDefaults?: {
+      minChars: number;
+      idleMs: number;
+    };
+  }
+
+  /**
    * 频道插件接口（泛型）
    */
   export interface ChannelPlugin<TAccount = unknown> {
@@ -335,6 +345,8 @@ declare module "openclaw/plugin-sdk" {
     version?: string;
     /** 插件能力 */
     capabilities?: ChannelPluginCapabilities;
+    /** 流式配置 */
+    streaming?: ChannelStreamingConfig;
     /** 重载配置 */
     reload?: { configPrefixes?: string[] };
     /** Onboarding 适配器 */

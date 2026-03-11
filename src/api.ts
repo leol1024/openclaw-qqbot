@@ -3,6 +3,7 @@
  * [修复版] 已重构为支持多实例并发，消除全局变量冲突
  */
 
+import { StreamState, type StreamConfig } from "./types.js";
 import { computeFileHash, getCachedFileInfo, setCachedFileInfo } from "./utils/upload-cache.js";
 import { sanitizeFileName } from "./utils/platform.js";
 
@@ -298,17 +299,20 @@ export async function getGatewayUrl(accessToken: string): Promise<string> {
   return data.url;
 }
 
-// ============ 消息发送接口 ============
+// ============ 消息发送接口（支持流式） ============
 
 export interface MessageResponse {
   id: string;
   timestamp: number | string;
+  /** 流式消息ID，用于后续分片 */
+  stream_id?: string;
 }
 
 function buildMessageBody(
   content: string,
   msgId: string | undefined,
-  msgSeq: number
+  msgSeq: number,
+  stream?: StreamConfig
 ): Record<string, unknown> {
   const body: Record<string, unknown> = currentMarkdownSupport
     ? {
@@ -325,6 +329,15 @@ function buildMessageBody(
   if (msgId) {
     body.msg_id = msgId;
   }
+
+  if (stream) {
+    body.stream = {
+      state: stream.state,
+      index: stream.index,
+      ...(stream.id ? { id: stream.id } : {}),
+    };
+  }
+
   return body;
 }
 
@@ -332,10 +345,11 @@ export async function sendC2CMessage(
   accessToken: string,
   openid: string,
   content: string,
-  msgId?: string
+  msgId?: string,
+  stream?: StreamConfig
 ): Promise<MessageResponse> {
   const msgSeq = msgId ? getNextMsgSeq(msgId) : 1;
-  const body = buildMessageBody(content, msgId, msgSeq);
+  const body = buildMessageBody(content, msgId, msgSeq, stream);
   return apiRequest(accessToken, "POST", `/v2/users/${openid}/messages`, body);
 }
 
