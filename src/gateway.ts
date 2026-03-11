@@ -338,6 +338,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   // 初始化 API 配置（markdown 支持）
   initApiConfig({
     markdownSupport: account.markdownSupport,
+    log: log ? { info: log.info.bind(log), error: log.error.bind(log) } : undefined,
   });
   log?.info(`[qqbot:${account.accountId}] API config: markdownSupport=${account.markdownSupport === true}, streamSupport=${account.streamSupport === true}`);
 
@@ -1511,7 +1512,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           //   QQ Bot 流式是 "增量追加"，每次发送 delta 文本，客户端拼接显示
           //
           const supportsStream = event.type === MSG_TYPE_C2C && account.streamSupport === true;
-          let streamSender = supportsStream ? createStreamSender(account, targetTo, event.messageId) : null;
+          const streamLog = log ? { info: log.info.bind(log), error: log.error.bind(log) } : undefined;
+          let streamSender = supportsStream ? createStreamSender(account, targetTo, event.messageId, streamLog) : null;
           let streamStarted = false; // 是否已开始流式发送
           let streamEnded = false; // 流式是否已结束
           let streamFailed = false; // 流式是否失败（停止当前消息发送）
@@ -1529,21 +1531,31 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
           // 重置心跳定时器（每次发送后调用）
           // keepalive 必须发送空字符串，这是 QQ 通道的要求
+          // ⚠️ 捕获注册时的 sender 实例，防止 rebuildStream 后用已 END 的旧 sender 发送
           const resetKeepalive = () => {
             clearKeepalive();
             if (streamSender && streamStarted && !streamEnded) {
+              const senderAtRegistration = streamSender; // 捕获当前实例
               keepaliveTimer = setTimeout(async () => {
-                if (!streamEnded && !sendingLock) {
-                  log?.info(`[qqbot:${account.accountId}] Sending stream keepalive`);
+                // 二次检查：确保 sender 没有被 rebuild 替换，且流式未结束
+                if (!streamEnded && !sendingLock && streamSender === senderAtRegistration) {
+                  log?.info(`[qqbot:${account.accountId}] 💓 Sending stream keepalive: sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
                   sendingLock = true;
                   try {
-                    await streamSender!.send("", false);
+                    // 三次检查：拿到锁后再确认一次（锁等待期间状态可能已变）
+                    if (streamEnded || streamSender !== senderAtRegistration) {
+                      log?.info(`[qqbot:${account.accountId}] 💓 Keepalive skipped: stream state changed while acquiring lock, sender=${senderAtRegistration.instanceId}, currentSender=${streamSender?.instanceId}, streamEnded=${streamEnded}`);
+                      return;
+                    }
+                    await streamSender.send("", false);
                     resetKeepalive();
                   } catch (err) {
-                    log?.error(`[qqbot:${account.accountId}] Keepalive failed: ${err}`);
+                    log?.error(`[qqbot:${account.accountId}] 💓 Keepalive failed: sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}, error=${err}`);
                   } finally {
                     sendingLock = false;
                   }
+                } else if (!streamEnded && streamSender !== senderAtRegistration) {
+                  log?.info(`[qqbot:${account.accountId}] 💓 Keepalive skipped (sender replaced): registered=${senderAtRegistration.instanceId}, current=${streamSender?.instanceId}`);
                 }
               }, STREAM_KEEPALIVE_INTERVAL);
             }
@@ -1566,14 +1578,18 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
           // 流式发送分片（增量文本）
           const sendStreamChunk = async (text: string, isEnd: boolean): Promise<boolean> => {
-            if (!streamSender || streamEnded) return false;
+            if (!streamSender || streamEnded) {
+              log?.error(`[qqbot:${account.accountId}] ⚠️ sendStreamChunk skipped: streamSender=${streamSender ? `[${streamSender.instanceId}]` : "null"}, streamEnded=${streamEnded}, isEnd=${isEnd}, textLen=${text.length}`);
+              return false;
+            }
+            const senderBefore = streamSender.instanceId;
             const result = await streamSender.send(text, isEnd);
             if (result.error) {
-              log?.error(`[qqbot:${account.accountId}] Stream send error: ${result.error}`);
+              log?.error(`[qqbot:${account.accountId}] ❌ Stream send error: sender=${senderBefore}, streamId=${streamSender.getContext().streamId}, error=${result.error}`);
               return false;
             }
             const ctx = streamSender.getContext();
-            log?.info(`[qqbot:${account.accountId}] [stream-chunk] index=${ctx.index - 1}, isEnd=${isEnd}, len=${text.length}, text=${JSON.stringify(text)}`);
+            log?.info(`[qqbot:${account.accountId}] [stream-chunk] sender=${senderBefore}, streamId=${ctx.streamId}, index=${ctx.index - 1}, isEnd=${isEnd}, len=${text.length}, text=${JSON.stringify(text)}`);
             if (isEnd) {
               streamEnded = true;
               clearKeepalive();
@@ -1596,6 +1612,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             sendingLock = true;
             try {
               if (streamStarted && !streamEnded) {
+                const ctx = streamSender!.getContext();
+                log?.info(`[qqbot:${account.accountId}] ⏸️ Interrupting stream: sender=${streamSender!.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}`);
                 if (streamBuffer) {
                   await sendStreamChunk(streamBuffer, false);
                   streamBuffer = "";
@@ -1603,7 +1621,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                 await streamSender!.end("");
                 streamEnded = true;
                 clearKeepalive();
-                log?.info(`[qqbot:${account.accountId}] Stream interrupted for media send`);
+                log?.info(`[qqbot:${account.accountId}] ⏸️ Stream interrupted successfully: sender=${streamSender!.instanceId}, streamId=${ctx.streamId}`);
               }
             } finally {
               sendingLock = false;
@@ -1614,10 +1632,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
            * 重建 StreamSender，用于中断后继续发送后续流式内容
            */
           const rebuildStream = () => {
-            streamSender = createStreamSender(account, targetTo, event.messageId);
+            const oldInstanceId = streamSender?.instanceId;
+            const oldStreamId = streamSender?.getContext().streamId;
+            streamSender = createStreamSender(account, targetTo, event.messageId, streamLog);
             streamStarted = false;
             streamEnded = false;
-            log?.info(`[qqbot:${account.accountId}] StreamSender rebuilt`);
+            log?.info(`[qqbot:${account.accountId}] 🔄 StreamSender rebuilt: old=[${oldInstanceId}|streamId=${oldStreamId}] → new=[${streamSender.instanceId}]`);
           };
 
           /**
@@ -1653,7 +1673,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     } else {
                       // 流式失败，停止当前消息发送
                       streamFailed = true;
-                      log?.error(`[qqbot:${account.accountId}] Stream send failed, stopping current message`);
+                      log?.error(`[qqbot:${account.accountId}] ❌ Stream send failed in streamSendTextOrFallback: sender=${streamSender?.instanceId}, streamId=${streamSender?.getContext().streamId}, stopping current message`);
                       streamBuffer = "";
                       return;
                     }
@@ -1708,17 +1728,21 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             // 内联中断（在 sendingLock 保护下，不能调用外层 interruptStream 避免死锁）
             interruptStream: async () => {
               if (streamStarted && !streamEnded) {
+                const ctx = streamSender!.getContext();
+                log?.info(`[qqbot:${account.accountId}] ⏸️ [handler] Interrupting stream: sender=${streamSender!.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}`);
                 await streamSender!.end("");
                 streamEnded = true;
                 clearKeepalive();
-                log?.info(`[qqbot:${account.accountId}] [handler] Stream interrupted for media send`);
+                log?.info(`[qqbot:${account.accountId}] ⏸️ [handler] Stream interrupted successfully: sender=${streamSender!.instanceId}, streamId=${ctx.streamId}`);
               }
             },
             rebuildStream: () => {
-              streamSender = createStreamSender(account, targetTo, event.messageId);
+              const oldInstanceId = streamSender?.instanceId;
+              const oldStreamId = streamSender?.getContext().streamId;
+              streamSender = createStreamSender(account, targetTo, event.messageId, streamLog);
               streamStarted = false;
               streamEnded = false;
-              log?.info(`[qqbot:${account.accountId}] [handler] StreamSender rebuilt`);
+              log?.info(`[qqbot:${account.accountId}] 🔄 [handler] StreamSender rebuilt: old=[${oldInstanceId}|streamId=${oldStreamId}] → new=[${streamSender.instanceId}]`);
             },
             sendMediaByType,
             // 公网图片 → markdown 嵌入流式（不中断）
@@ -1824,7 +1848,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           //
 
           const handlePartialReply = supportsStream ? async (payload: { text?: string }) => {
-            if (!streamSender || streamEnded || streamFailed) return;
+            if (!streamSender || streamEnded || streamFailed) {
+              if (streamEnded || streamFailed) {
+                log?.info(`[qqbot:${account.accountId}] handlePartialReply skipped: sender=${streamSender?.instanceId ?? "null"}, streamEnded=${streamEnded}, streamFailed=${streamFailed}`);
+              }
+              return;
+            }
 
             const fullText = payload.text ?? "";
             if (!fullText || fullText.length <= partialReplySentLength) return;
@@ -1883,7 +1912,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   } else {
                     // 流式发送失败，停止当前消息发送
                     streamFailed = true;
-                    log?.error(`[qqbot:${account.accountId}] Stream send failed in onPartialReply, stopping current message`);
+                    log?.error(`[qqbot:${account.accountId}] ❌ Stream send failed in onPartialReply: sender=${streamSender?.instanceId}, streamId=${streamSender?.getContext().streamId}, stopping current message`);
                     streamBuffer = "";
                     return;
                   }
@@ -2404,14 +2433,29 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               // 流式模式使用 onPartialReply 实现 token 级实时发送
               onPartialReply: handlePartialReply,
               // 多消息边界回调：当新的 assistant 消息开始时，结束上一个流式会话并开始新的
+              // ⚠️ 必须获取 sendingLock，防止与 handlePartialReply/keepalive 竞态
               onAssistantMessageStart: supportsStream ? async () => {
                 if (streamStarted && !streamEnded && streamSender) {
-                  log?.info(`[qqbot:${account.accountId}] onAssistantMessageStart: ending current stream for new message`);
+                  const ctx = streamSender.getContext();
+                  log?.info(`[qqbot:${account.accountId}] 🔀 onAssistantMessageStart: ending current stream for new message, sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}`);
+                  while (sendingLock) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                  }
+                  sendingLock = true;
                   try {
+                    // 二次检查：拿到锁后状态可能已被其他异步流改变
+                    if (streamEnded) {
+                      log?.info(`[qqbot:${account.accountId}] 🔀 onAssistantMessageStart: stream already ended by another async flow, sender=${streamSender.instanceId}`);
+                      rebuildStream();
+                      partialReplySentLength = 0;
+                      pendingPayloadText = "";
+                      return;
+                    }
                     // 安全刷新缓冲区（处理完整/不完整媒体标签）
                     const pendingMedia = await flushStreamBufferSafe();
                     await streamSender.end("");
                     streamEnded = true;
+                    clearKeepalive();
                     // 发送提取出的媒体（在流式结束后）
                     for (const media of pendingMedia) {
                       await sendMediaByType(media.type, media.path);
@@ -2419,13 +2463,15 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     // 重置 partialReplySentLength，新消息的 onPartialReply 累积文本从零开始
                     partialReplySentLength = 0;
                     pendingPayloadText = ""; // 重置 payload 暂存
-                    log?.info(`[qqbot:${account.accountId}] Previous stream ended, rebuilding for new message`);
+                    log?.info(`[qqbot:${account.accountId}] 🔀 onAssistantMessageStart: previous stream ended, sender=${streamSender.instanceId}, streamId=${streamSender.getContext().streamId}, rebuilding`);
                     // 重建 stream sender，让后续 handlePartialReply 能继续工作
                     // 如果不重建，streamEnded=true 会导致新消息的 handlePartialReply 直接跳过
                     // 同时 deliver 也会因为 supportsStream && streamSender && !streamFailed 为 true 而跳过
                     rebuildStream();
                   } catch (err) {
                     log?.error(`[qqbot:${account.accountId}] Failed to end stream on message boundary: ${err}`);
+                  } finally {
+                    sendingLock = false;
                   }
                 }
               } : undefined,
@@ -2451,10 +2497,13 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               
               // 先结束当前流式（如果已启动）
               if (streamStarted && !streamEnded) {
+                const ctx = streamSender.getContext();
+                log?.info(`[qqbot:${account.accountId}] 🏁 Ending stream for pending payload: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}`);
                 // 安全刷新缓冲区（处理完整/不完整媒体标签）
                 const pendingMedia = await flushStreamBufferSafe();
                 await streamSender.end("");
                 streamEnded = true;
+                log?.info(`[qqbot:${account.accountId}] 🏁 Stream ended for payload: sender=${streamSender.instanceId}, streamId=${ctx.streamId}`);
                 // 发送提取出的媒体
                 for (const media of pendingMedia) {
                   await sendMediaByType(media.type, media.path);
@@ -2474,20 +2523,22 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             
             // 分发完成后，如果使用了流式且有内容，发送结束标记
             if (streamSender && !streamEnded && streamStarted) {
+              const ctx = streamSender.getContext();
+              log?.info(`[qqbot:${account.accountId}] 🏁 Ending stream (dispatch complete): sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}`);
               // 安全刷新缓冲区（处理完整/不完整媒体标签）
               const pendingMedia = await flushStreamBufferSafe();
               const endResult = await streamSender.end("");
               if (endResult.error) {
-                log?.error(`[qqbot:${account.accountId}] Stream end failed: ${endResult.error}`);
+                log?.error(`[qqbot:${account.accountId}] ❌ Stream end failed: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, error=${endResult.error}`);
               }
               streamEnded = true;
               // 发送提取出的媒体（在流式结束后）
               for (const media of pendingMedia) {
                 await sendMediaByType(media.type, media.path);
               }
-              log?.info(`[qqbot:${account.accountId}] Stream completed, total chunks: ${streamSender.getContext().index}`);
+              log?.info(`[qqbot:${account.accountId}] ✅ Stream completed: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, totalChunks=${streamSender.getContext().index}`);
             } else if (streamSender && !streamEnded) {
-              log?.info(`[qqbot:${account.accountId}] Stream not ended: streamStarted=${streamStarted}, streamFailed=${streamFailed}, buffer=${JSON.stringify(streamBuffer)}`);
+              log?.info(`[qqbot:${account.accountId}] Stream not ended: sender=${streamSender.instanceId}, streamStarted=${streamStarted}, streamFailed=${streamFailed}, buffer=${JSON.stringify(streamBuffer)}`);
             }
           } catch (err) {
             clearKeepalive();
@@ -2497,15 +2548,20 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             // 流式结束处理（超时场景）
             if (streamSender && !streamEnded && streamStarted) {
               try {
+                const ctx = streamSender.getContext();
+                log?.error(`[qqbot:${account.accountId}] ⏰ Ending stream due to timeout: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}`);
                 // 安全刷新缓冲区（处理完整/不完整媒体标签）
                 const pendingMedia = await flushStreamBufferSafe();
                 await streamSender.end("\n\n[超时]");
                 streamEnded = true;
+                log?.info(`[qqbot:${account.accountId}] ⏰ Stream ended due to timeout: sender=${streamSender.instanceId}, streamId=${ctx.streamId}`);
                 // 发送提取出的媒体（在流式结束后）
                 for (const media of pendingMedia) {
                   await sendMediaByType(media.type, media.path);
                 }
-              } catch {}
+              } catch (endErr) {
+                log?.error(`[qqbot:${account.accountId}] ❌ Failed to end stream on timeout: sender=${streamSender.instanceId}, error=${endErr}`);
+              }
             }
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);

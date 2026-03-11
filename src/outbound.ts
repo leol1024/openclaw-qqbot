@@ -1305,14 +1305,20 @@ export class StreamSender {
   private targetId: string;
   private msgId?: string;
   private account: ResolvedQQBotAccount;
+  private log?: { info: (...args: any[]) => void; error: (...args: any[]) => void };
+  /** 唯一实例标识，用于区分 rebuild 前后的不同 sender */
+  readonly instanceId: string;
 
   constructor(
     account: ResolvedQQBotAccount,
     to: string,
-    replyToId?: string | null
+    replyToId?: string | null,
+    log?: { info: (...args: any[]) => void; error: (...args: any[]) => void }
   ) {
     this.account = account;
     this.msgId = replyToId ?? undefined;
+    this.log = log;
+    this.instanceId = Math.random().toString(36).slice(2, 8);
     this.context = {
       index: 0,
       streamId: "",
@@ -1323,6 +1329,8 @@ export class StreamSender {
     const target = parseTarget(to);
     this.targetType = target.type;
     this.targetId = target.id;
+
+    this.log?.info(`[StreamSender:${this.instanceId}] Created: target=${to}, replyTo=${replyToId ?? "none"}`);
   }
 
   /**
@@ -1333,6 +1341,7 @@ export class StreamSender {
    */
   async send(text: string, isEnd = false): Promise<OutboundResult> {
     if (this.context.ended) {
+      this.log?.error(`[StreamSender:${this.instanceId}] ⚠️ Attempted to send on ended stream! streamId=${this.context.streamId}, index=${this.context.index}, isEnd=${isEnd}, textLen=${text.length}`);
       return { channel: "qqbot", error: "Stream already ended" };
     }
 
@@ -1366,15 +1375,18 @@ export class StreamSender {
         // 第一次发送后，服务端会返回 stream_id，后续需要带上
         if (this.context.index === 0 && result.stream_id) {
           this.context.streamId = result.stream_id;
+          this.log?.info(`[StreamSender:${this.instanceId}] Got streamId from server: ${this.context.streamId}`);
         } else if (this.context.index === 0 && result.id && !this.context.streamId) {
           // 某些情况下 stream_id 可能在 id 字段返回
           this.context.streamId = result.id;
+          this.log?.info(`[StreamSender:${this.instanceId}] Got streamId from result.id: ${this.context.streamId}`);
         }
 
         this.context.index++;
 
         if (isEnd) {
           this.context.ended = true;
+          this.log?.info(`[StreamSender:${this.instanceId}] 🏁 Stream ENDED: streamId=${this.context.streamId}, totalChunks=${this.context.index}, lastTextLen=${text.length}`);
         }
 
         // 记录被动回复次数（仅首次分片计入限流）
@@ -1439,6 +1451,7 @@ export class StreamSender {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      this.log?.error(`[StreamSender:${this.instanceId}] ❌ Send failed: streamId=${this.context.streamId}, index=${this.context.index}, isEnd=${isEnd}, error=${message}`);
       return { channel: "qqbot", error: message };
     }
   }
@@ -1480,7 +1493,8 @@ export class StreamSender {
 export function createStreamSender(
   account: ResolvedQQBotAccount,
   to: string,
-  replyToId?: string | null
+  replyToId?: string | null,
+  log?: { info: (...args: any[]) => void; error: (...args: any[]) => void }
 ): StreamSender {
-  return new StreamSender(account, to, replyToId);
+  return new StreamSender(account, to, replyToId, log);
 }
