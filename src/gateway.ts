@@ -2511,8 +2511,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             if (pendingPayloadText && supportsStream && streamSender) {
               log?.info(`[qqbot:${account.accountId}] Processing pending payload (${pendingPayloadText.length} chars)`);
               
-              // 先结束当前流式（如果已启动）
-              if (streamStarted && !streamEnded) {
+              // 先结束当前流式（如果已启动或 buffer 有剩余内容）
+              if ((streamStarted || streamBuffer) && !streamEnded) {
                 const ctx = streamSender.getContext();
                 log?.info(`[qqbot:${account.accountId}] 🏁 Ending stream for pending payload: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}`);
                 // 安全刷新缓冲区（处理完整/不完整媒体标签）
@@ -2538,9 +2538,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             }
             
             // 分发完成后，如果使用了流式且有内容，发送结束标记
-            if (streamSender && !streamEnded && streamStarted) {
+            // 注意：streamStarted 仅在实际发送过 chunk 后才为 true
+            // 但 buffer 中可能有未达到 STREAM_MIN_FLUSH_CHARS 阈值的内容尚未发送
+            // 此时 streamStarted=false 但 buffer 非空，也需要 flush + 发送停止分片
+            if (streamSender && !streamEnded && (streamStarted || streamBuffer)) {
               const ctx = streamSender.getContext();
-              log?.info(`[qqbot:${account.accountId}] 🏁 Ending stream (dispatch complete): sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}`);
+              log?.info(`[qqbot:${account.accountId}] 🏁 Ending stream (dispatch complete): sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}, streamStarted=${streamStarted}`);
               // 安全刷新缓冲区（处理完整/不完整媒体标签）
               const pendingMedia = await flushStreamBufferSafe();
               const endResult = await streamSender.end("");
@@ -2562,10 +2565,11 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               clearTimeout(timeoutId);
             }
             // 流式结束处理（超时场景）
-            if (streamSender && !streamEnded && streamStarted) {
+            // 同正常完成场景：streamStarted=false 但 buffer 非空时也需要处理
+            if (streamSender && !streamEnded && (streamStarted || streamBuffer)) {
               try {
                 const ctx = streamSender.getContext();
-                log?.error(`[qqbot:${account.accountId}] ⏰ Ending stream due to timeout: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}`);
+                log?.error(`[qqbot:${account.accountId}] ⏰ Ending stream due to timeout: sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}, bufferLen=${streamBuffer.length}, streamStarted=${streamStarted}`);
                 // 安全刷新缓冲区（处理完整/不完整媒体标签）
                 const pendingMedia = await flushStreamBufferSafe();
                 await streamSender.end("\n\n[超时]");
