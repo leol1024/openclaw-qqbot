@@ -81,6 +81,8 @@ async function doFetchToken(appId: string, clientSecret: string): Promise<string
   
   // 打印请求信息（隐藏敏感信息）
   console.log(`[qqbot-api:${appId}] >>> POST ${TOKEN_URL}`);
+  console.log(`[qqbot-api:${appId}] >>> Headers: ${JSON.stringify(requestHeaders, null, 2)}`);
+  console.log(`[qqbot-api:${appId}] >>> Body: ${JSON.stringify({ appId, clientSecret: "***" }, null, 2)}`);
 
   let response: Response;
   try {
@@ -100,14 +102,21 @@ async function doFetchToken(appId: string, clientSecret: string): Promise<string
     responseHeaders[key] = value;
   });
   console.log(`[qqbot-api:${appId}] <<< Status: ${response.status} ${response.statusText}`);
+  console.log(`[qqbot-api:${appId}] <<< Response Headers: ${JSON.stringify(responseHeaders, null, 2)}`);
 
   let data: { access_token?: string; expires_in?: number };
   let rawBody: string;
   try {
     rawBody = await response.text();
-    // 隐藏 token 值
-    const logBody = rawBody.replace(/"access_token"\s*:\s*"[^"]+"/g, '"access_token": "***"');
-    console.log(`[qqbot-api:${appId}] <<< Body:`, logBody);
+    // 隐藏 token 值，格式化打印
+    try {
+      const parsed = JSON.parse(rawBody);
+      const logParsed = { ...parsed };
+      if (logParsed.access_token) logParsed.access_token = "***";
+      console.log(`[qqbot-api:${appId}] <<< Response Body: ${JSON.stringify(logParsed, null, 2)}`);
+    } catch {
+      console.log(`[qqbot-api:${appId}] <<< Response Body (raw): ${rawBody.slice(0, 2000)}`);
+    }
     data = JSON.parse(rawBody) as { access_token?: string; expires_in?: number };
   } catch (err) {
     console.error(`[qqbot-api:${appId}] <<< Parse error:`, err);
@@ -208,13 +217,16 @@ export async function apiRequest<T = unknown>(
     options.body = JSON.stringify(body);
   }
 
-  // 打印请求信息
+  // 打印请求信息：方法、URL、请求头、请求体（JSON 格式化）
   console.log(`[qqbot-api] >>> ${method} ${url} (timeout: ${timeout}ms)`);
+  console.log(`[qqbot-api] >>> Headers: ${JSON.stringify(headers, null, 2)}`);
   if (body) {
     const logBody = { ...body } as Record<string, unknown>;
+    // 脱敏：base64 文件数据只显示长度
     if (typeof logBody.file_data === "string") {
       logBody.file_data = `<base64 ${(logBody.file_data as string).length} chars>`;
     }
+    console.log(`[qqbot-api] >>> Body: ${JSON.stringify(logBody, null, 2)}`);
   }
 
   let res: Response;
@@ -232,16 +244,25 @@ export async function apiRequest<T = unknown>(
     clearTimeout(timeoutId);
   }
 
+  // 打印响应头
   const responseHeaders: Record<string, string> = {};
   res.headers.forEach((value, key) => {
     responseHeaders[key] = value;
   });
   console.log(`[qqbot-api] <<< Status: ${res.status} ${res.statusText}`);
+  console.log(`[qqbot-api] <<< Response Headers: ${JSON.stringify(responseHeaders, null, 2)}`);
 
   let data: T;
   let rawBody: string;
   try {
     rawBody = await res.text();
+    // 打印响应体（尝试 JSON 格式化）
+    try {
+      const parsed = JSON.parse(rawBody);
+      console.log(`[qqbot-api] <<< Response Body: ${JSON.stringify(parsed, null, 2)}`);
+    } catch {
+      console.log(`[qqbot-api] <<< Response Body (raw): ${rawBody.slice(0, 2000)}`);
+    }
     data = JSON.parse(rawBody) as T;
   } catch (err) {
     throw new Error(`Failed to parse response[${path}]: ${err instanceof Error ? err.message : String(err)}`);

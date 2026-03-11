@@ -1686,6 +1686,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           //   - QQBOT_PAYLOAD → 暂存到 pendingPayloadText → 流式结束阶段统一处理
           //
           let partialReplySentLength = 0; // 已通过 onPartialReply 发送的累积文本长度
+          let partialReplyReceived = false; // onPartialReply 是否被调用过（区别于 streamStarted：后者要求实际发送过流式 chunk）
 
           /**
            * 构建 StreamHandlerContext —— 将 gateway 闭包状态桥接给 handler 链
@@ -1829,6 +1830,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             if (!fullText || fullText.length <= partialReplySentLength) return;
 
             hasResponse = true;
+            partialReplyReceived = true;
 
             // 如果之前已经标记为 payload（正在逐步生成中），持续暂存
             if (pendingPayloadText) {
@@ -1960,22 +1962,31 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
                 let replyText = payload.text ?? "";
 
-                // ============ 流式模式：deliver 统一跳过 ============
-                // 流式模式下，所有内容都通过 onPartialReply 实时处理：
+                // ============ 流式模式：deliver 跳过（仅限 onPartialReply 已处理的内容） ============
+                // 流式模式下，AI 生成的内容都通过 onPartialReply 实时处理：
                 //   - 纯文本 → 攒包缓冲 → 流式增量发送
                 //   - 媒体标签 → 检测到完整标签后中断流式 → 发送富媒体 → 重建
                 //   - QQBOT_PAYLOAD → 暂存到 pendingPayloadText → 流式结束阶段统一处理
+                //
+                // 但有些内容只走 deliver 不走 onPartialReply（如 OpenClaw 的 /commands 等内置指令），
+                // 这些响应在 partialReplyReceived=false 时到达 deliver，必须放行走非流式路径正常发送。
                 if (supportsStream && streamSender && !streamFailed) {
-                  // 重置 partialReplySentLength，为下一个 block（如多消息场景）做准备
-                  partialReplySentLength = 0;
+                  if (partialReplyReceived || pendingPayloadText) {
+                    // onPartialReply 已被调用过或有暂存 payload，说明内容已由流式处理，跳过 deliver
+                    // 重置 partialReplySentLength，为下一个 block（如多消息场景）做准备
+                    partialReplySentLength = 0;
 
-                  log?.info(`[qqbot:${account.accountId}] deliver (stream): skipping, all content handled by onPartialReply (${replyText.length} chars${pendingPayloadText ? ", has pending payload" : ""})`);
-                  pluginRuntime.channel.activity.record({
-                    channel: "qqbot",
-                    accountId: account.accountId,
-                    direction: "outbound",
-                  });
-                  return;
+                    log?.info(`[qqbot:${account.accountId}] deliver (stream): skipping, all content handled by onPartialReply (${replyText.length} chars${pendingPayloadText ? ", has pending payload" : ""})`);
+                    pluginRuntime.channel.activity.record({
+                      channel: "qqbot",
+                      accountId: account.accountId,
+                      direction: "outbound",
+                    });
+                    return;
+                  }
+                  // onPartialReply 未被调用过且无暂存 payload：说明这是不经过 onPartialReply 的独立指令（如 /commands）
+                  // 放行到下方非流式路径正常发送
+                  log?.info(`[qqbot:${account.accountId}] deliver (stream, no partial): treating as non-stream, kind=${info.kind}, text=${replyText.slice(0, 100)}`);
                 }
                 
                 // ============ 媒体标签解析（使用共享的 parseMediaTags） ============
@@ -2385,7 +2396,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               // C2C（streamSupport=true）：
               //   disableBlockStreaming=true
               //   onPartialReply=handlePartialReply → token 级实时流式发送 + 富媒体标签处理
-              //   deliver 流式场景统一跳过（payload 在流式结束阶段处理）
+              //   deliver 流式已启动时跳过（payload 在流式结束阶段处理），未启动时放行（如 /commands 指令）
               // 非 C2C（群聊/频道）或 C2C（streamSupport=false）：
               //   走框架 block streaming pipeline，由 coalesce 配置控制合并
               //
@@ -2538,6 +2549,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           const rawData = data.toString();
           const payload = JSON.parse(rawData) as WSPayload;
           const { op, d, s, t } = payload;
+
+          // 打印收到的所有 WebSocket 消息（JSON 格式化）
+          log?.info(`[qqbot:${account.accountId}] <<< WS received: ${JSON.stringify(payload, null, 2)}`);
 
           if (s) {
             lastSeq = s;
