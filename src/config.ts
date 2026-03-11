@@ -120,6 +120,7 @@ export function resolveQQBotAccount(
     imageServerBaseUrl: accountConfig.imageServerBaseUrl || process.env.QQBOT_IMAGE_SERVER_BASE_URL,
     markdownSupport: accountConfig.markdownSupport !== false,
     streamSupport: accountConfig.streamSupport !== false,
+    debug: accountConfig.debug === true,
     config: accountConfig,
   };
 }

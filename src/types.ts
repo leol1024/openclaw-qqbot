@@ -25,6 +25,8 @@ export interface ResolvedQQBotAccount {
   markdownSupport: boolean;
   /** 是否启用 C2C 流式消息（默认 false，需要用户主动开启） */
   streamSupport: boolean;
+  /** 是否启用调试日志（默认 false，开启后输出详细日志） */
+  debug: boolean;
   config: QQBotAccountConfig;
 }
 
@@ -47,6 +49,8 @@ export interface QQBotAccountConfig {
   markdownSupport?: boolean;
   /** 是否启用 C2C 流式消息（默认 false，设为 true 可开启） */
   streamSupport?: boolean;
+  /** 是否启用调试日志（默认 false，设为 true 可输出详细日志） */
+  debug?: boolean;
   /**
    * @deprecated 请使用 audioFormatPolicy.uploadDirectFormats
    * 可直接上传的音频格式（不转换为 SILK），向后兼容

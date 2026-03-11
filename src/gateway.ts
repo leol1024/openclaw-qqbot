@@ -340,7 +340,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     markdownSupport: account.markdownSupport,
     log: log ? { info: log.info.bind(log), error: log.error.bind(log) } : undefined,
   });
-  log?.info(`[qqbot:${account.accountId}] API config: markdownSupport=${account.markdownSupport === true}, streamSupport=${account.streamSupport === true}`);
+  log?.info(`[qqbot:${account.accountId}] API config: markdownSupport=${account.markdownSupport === true}, streamSupport=${account.streamSupport === true}, debug=${account.debug === true}`);
+
+  // debug 日志：仅当 account.debug=true 时输出，用于非关键路径的详细信息
+  const debugLog = account.debug ? (msg: string) => log?.info(msg) : undefined;
 
   // TTS 配置验证
   const ttsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
@@ -1545,12 +1548,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     log?.info(`[qqbot:${account.accountId}] 💓 Keepalive suppressed: consecutive count ${count} reached limit ${MAX_KEEPALIVE_COUNT}, waiting for actual message to resume. sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
                     return;
                   }
-                  log?.info(`[qqbot:${account.accountId}] 💓 Sending stream keepalive (${count + 1}/${MAX_KEEPALIVE_COUNT}): sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
+                  debugLog?.(`[qqbot:${account.accountId}] 💓 Sending stream keepalive (${count + 1}/${MAX_KEEPALIVE_COUNT}): sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
                   sendingLock = true;
                   try {
                     // 三次检查：拿到锁后再确认一次（锁等待期间状态可能已变）
                     if (streamEnded || streamFailed || streamSender !== senderAtRegistration) {
-                      log?.info(`[qqbot:${account.accountId}] 💓 Keepalive skipped: stream state changed while acquiring lock, sender=${senderAtRegistration.instanceId}, currentSender=${streamSender?.instanceId}, streamEnded=${streamEnded}`);
+                      debugLog?.(`[qqbot:${account.accountId}] 💓 Keepalive skipped: stream state changed while acquiring lock, sender=${senderAtRegistration.instanceId}, currentSender=${streamSender?.instanceId}, streamEnded=${streamEnded}`);
                       return;
                     }
                     await streamSender.send("", false);
@@ -1561,7 +1564,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     sendingLock = false;
                   }
                 } else if (!streamEnded && streamSender !== senderAtRegistration) {
-                  log?.info(`[qqbot:${account.accountId}] 💓 Keepalive skipped (sender replaced): registered=${senderAtRegistration.instanceId}, current=${streamSender?.instanceId}`);
+                  debugLog?.(`[qqbot:${account.accountId}] 💓 Keepalive skipped (sender replaced): registered=${senderAtRegistration.instanceId}, current=${streamSender?.instanceId}`);
                 }
               }, STREAM_KEEPALIVE_INTERVAL);
             }
@@ -1595,7 +1598,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               return false;
             }
             const ctx = streamSender.getContext();
-            log?.info(`[qqbot:${account.accountId}] [stream-chunk] sender=${senderBefore}, streamId=${ctx.streamId}, index=${ctx.index - 1}, isEnd=${isEnd}, len=${text.length}, text=${JSON.stringify(text)}`);
+            debugLog?.(`[qqbot:${account.accountId}] [stream-chunk] sender=${senderBefore}, streamId=${ctx.streamId}, index=${ctx.index - 1}, isEnd=${isEnd}, len=${text.length}, text=${JSON.stringify(text)}`);
             if (isEnd) {
               streamEnded = true;
               clearKeepalive();
@@ -1690,7 +1693,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   }
                 }
 
-                log?.info(`[qqbot:${account.accountId}] Stream text buffered, buffer: ${streamBuffer.length} chars`);
+                debugLog?.(`[qqbot:${account.accountId}] Stream text buffered, buffer: ${streamBuffer.length} chars`);
               } finally {
                 sendingLock = false;
               }
@@ -1782,7 +1785,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
            */
           const flushStreamBufferSafe = async (): Promise<Array<{ type: string; path: string }>> => {
             const pendingMedia: Array<{ type: string; path: string }> = [];
-            log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: enter, buffer=${JSON.stringify(streamBuffer)}`);
+            debugLog?.(`[qqbot:${account.accountId}] flushStreamBufferSafe: enter, buffer=${JSON.stringify(streamBuffer)}`);
             if (!streamBuffer) return pendingMedia;
 
             // 1. 通过责任链处理完整的媒体标签
@@ -1798,7 +1801,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               sendingLock = false;
             }
 
-            log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: after chain.processBuffer, buffer=${JSON.stringify(streamBuffer)}`);
+            debugLog?.(`[qqbot:${account.accountId}] flushStreamBufferSafe: after chain.processBuffer, buffer=${JSON.stringify(streamBuffer)}`);
             if (!streamBuffer) return pendingMedia;
 
             // 2. 检测不完整的媒体标签（AI 没有输出闭合标签的情况）
@@ -1828,7 +1831,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
                 if (mediaPath) {
                   const mediaType = tagNameToQueueType(tagName);
-                  log?.info(`[qqbot:${account.accountId}] Extracted incomplete ${mediaType} tag for post-stream send: ${mediaPath.slice(0, 120)}`);
+                  debugLog?.(`[qqbot:${account.accountId}] Extracted incomplete ${mediaType} tag for post-stream send: ${mediaPath.slice(0, 120)}`);
                   pendingMedia.push({ type: mediaType, path: mediaPath });
                 }
 
@@ -1841,7 +1844,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             // 3. 发送剩余的纯文本
             if (streamBuffer) {
-              log?.info(`[qqbot:${account.accountId}] flushStreamBufferSafe: sending remaining text, buffer=${JSON.stringify(streamBuffer)}`);
+              debugLog?.(`[qqbot:${account.accountId}] flushStreamBufferSafe: sending remaining text, buffer=${JSON.stringify(streamBuffer)}`);
               await sendStreamChunk(streamBuffer, false);
               streamBuffer = "";
             }
@@ -1862,7 +1865,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             if (!streamSender || streamEnded || streamFailed) {
               if ((streamEnded || streamFailed) && !partialReplySkipLogged) {
                 partialReplySkipLogged = true;
-                log?.info(`[qqbot:${account.accountId}] handlePartialReply skipped (first occurrence, suppressing further): sender=${streamSender?.instanceId ?? "null"}, streamEnded=${streamEnded}, streamFailed=${streamFailed}`);
+                debugLog?.(`[qqbot:${account.accountId}] handlePartialReply skipped (first occurrence, suppressing further): sender=${streamSender?.instanceId ?? "null"}, streamEnded=${streamEnded}, streamFailed=${streamFailed}`);
               }
               return;
             }
@@ -1882,7 +1885,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             // ---- 步骤 1: 攒包 ----
             const delta = fullText.slice(partialReplySentLength);
-            log?.info(`[qqbot:${account.accountId}] handlePartialReply: fullLen=${fullText.length}, sentLen=${partialReplySentLength}, delta=${JSON.stringify(delta)}, buffer=${JSON.stringify(streamBuffer)}, fullText=${JSON.stringify(fullText)}`);
+            debugLog?.(`[qqbot:${account.accountId}] handlePartialReply: fullLen=${fullText.length}, sentLen=${partialReplySentLength}, delta=${JSON.stringify(delta)}, buffer=${JSON.stringify(streamBuffer)}, fullText=${JSON.stringify(fullText)}`);
             partialReplySentLength = fullText.length;
             streamBuffer += delta;
 
@@ -2018,7 +2021,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     // 重置 partialReplySentLength，为下一个 block（如多消息场景）做准备
                     partialReplySentLength = 0;
 
-                    log?.info(`[qqbot:${account.accountId}] deliver (stream): skipping, all content handled by onPartialReply (${replyText.length} chars${pendingPayloadText ? ", has pending payload" : ""})`);
+                    debugLog?.(`[qqbot:${account.accountId}] deliver (stream): skipping, all content handled by onPartialReply (${replyText.length} chars${pendingPayloadText ? ", has pending payload" : ""})`);
                     pluginRuntime.channel.activity.record({
                       channel: "qqbot",
                       accountId: account.accountId,
@@ -2028,7 +2031,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   }
                   // onPartialReply 未被调用过且无暂存 payload：说明这是不经过 onPartialReply 的独立指令（如 /commands）
                   // 放行到下方非流式路径正常发送
-                  log?.info(`[qqbot:${account.accountId}] deliver (stream, no partial): treating as non-stream, kind=${info.kind}, text=${replyText.slice(0, 100)}`);
+                  debugLog?.(`[qqbot:${account.accountId}] deliver (stream, no partial): treating as non-stream, kind=${info.kind}, text=${replyText.slice(0, 100)}`);
                 }
                 
                 // ============ 媒体标签解析（使用共享的 parseMediaTags） ============
@@ -2053,7 +2056,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                   log?.info(`[qqbot:${account.accountId}] Send queue: ${sendQueue.map(item => item.type).join(" -> ")}`);
                   
                   const isStreaming = supportsStream && streamSender && !streamFailed;
-                  log?.info(`[qqbot:${account.accountId}] Processing media tags (streaming: ${!!isStreaming})`);
+                  debugLog?.(`[qqbot:${account.accountId}] Processing media tags (streaming: ${!!isStreaming})`);
                   
                   // ============ 统一的富媒体发送队列处理 ============
                   // 流式模式：文本→流式发送，公网图片→markdown嵌入流式，本地图片/语音/视频/文件→中断流式→发送→重建
@@ -2086,7 +2089,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                         try {
                           const size = await getImageSize(imagePath);
                           const mdImage = formatQQBotMarkdownImage(imagePath, size);
-                          log?.info(`[qqbot:${account.accountId}] Embedding HTTP image as markdown in stream: ${size ? `${size.width}x${size.height}` : 'default'}`);
+                          debugLog?.(`[qqbot:${account.accountId}] Embedding HTTP image as markdown in stream: ${size ? `${size.width}x${size.height}` : 'default'}`);
                           await streamSendTextOrFallback("\n" + mdImage + "\n");
                         } catch (err) {
                           log?.info(`[qqbot:${account.accountId}] Failed to get image size, using default: ${err}`);

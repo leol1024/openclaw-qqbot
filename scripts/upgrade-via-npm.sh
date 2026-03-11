@@ -13,6 +13,7 @@ PKG_NAME="@tencent-connect/openclaw-qqbot"
 INSTALL_SRC=""
 APPID=""
 SECRET=""
+STREAM=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -31,6 +32,7 @@ print_usage() {
     echo "  upgrade-via-npm.sh                              # 升级到 latest（默认）"
     echo "  upgrade-via-npm.sh --version <版本号>            # 升级到指定版本"
     echo "  upgrade-via-npm.sh --appid <appid> --secret <secret>  # 配置通道并启动"
+    echo "  upgrade-via-npm.sh --stream <yes|no>              # 是否启用流式消息（仅C2C私聊生效）"
     if [ -n "$LOCAL_VERSION" ]; then
         echo "  upgrade-via-npm.sh --self-version               # 升级到当前仓库版本（$LOCAL_VERSION）"
     else
@@ -40,6 +42,7 @@ print_usage() {
     echo "也可以通过环境变量设置:"
     echo "  QQBOT_APPID           QQ机器人 appid"
     echo "  QQBOT_SECRET          QQ机器人 secret"
+    echo "  QQBOT_STREAM          是否启用流式消息（yes/no）"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -69,6 +72,11 @@ while [[ $# -gt 0 ]]; do
             SECRET="$2"
             shift 2
             ;;
+        --stream)
+            [ -z "$2" ] && echo "❌ --stream 需要参数" && exit 1
+            STREAM="$2"
+            shift 2
+            ;;
         -h|--help)
             print_usage
             exit 0
@@ -81,6 +89,7 @@ INSTALL_SRC="${INSTALL_SRC:-${PKG_NAME}@latest}"
 # 使用命令行参数或环境变量
 APPID="${APPID:-$QQBOT_APPID}"
 SECRET="${SECRET:-$QQBOT_SECRET}"
+STREAM="${STREAM:-$QQBOT_STREAM}"
 
 # 检测 CLI
 CMD=""
@@ -185,6 +194,60 @@ if [ -n "$APPID" ] && [ -n "$SECRET" ]; then
         echo "  ✅ 机器人通道配置成功"
     else
         echo "  ⚠️  通道配置失败，请手动执行: $CMD channels add --channel qqbot --token \"$DESIRED_TOKEN\""
+    fi
+fi
+
+# 配置 stream 选项（仅在明确指定时才配置）
+if [ -n "$STREAM" ]; then
+    echo ""
+    echo "配置 stream 选项..."
+    if [ "$STREAM" = "yes" ] || [ "$STREAM" = "y" ] || [ "$STREAM" = "true" ]; then
+        STREAM_VALUE="true"
+        echo "启用流式消息（仅C2C私聊生效）..."
+    else
+        STREAM_VALUE="false"
+        echo "禁用流式消息..."
+    fi
+
+    CURRENT_STREAM_VALUE=$(node -e "
+      const fs = require('fs');
+      const path = require('path');
+      const home = process.env.HOME;
+      for (const app of ['openclaw', 'clawdbot', 'moltbot']) {
+        const f = path.join(home, '.' + app, app + '.json');
+        if (!fs.existsSync(f)) continue;
+        try {
+          const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+          const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
+          for (const key of keys) {
+            const ch = cfg.channels && cfg.channels[key];
+            if (!ch) continue;
+            if (typeof ch.streamSupport === 'boolean') { process.stdout.write(String(ch.streamSupport)); process.exit(0); }
+          }
+        } catch {}
+      }
+    " 2>/dev/null || true)
+
+    if [ "$CURRENT_STREAM_VALUE" = "$STREAM_VALUE" ]; then
+        echo "  ✅ stream 配置已是目标值，跳过写入"
+    elif $CMD config set channels.qqbot.streamSupport "$STREAM_VALUE" 2>&1; then
+        echo "  ✅ stream 配置成功"
+    else
+        echo "  ⚠️  $CMD config set 失败，尝试直接编辑配置文件..."
+        if [ -f "$APP_CONFIG" ] && node -e "
+          const fs = require('fs');
+          const cfg = JSON.parse(fs.readFileSync('$APP_CONFIG', 'utf-8'));
+          if (!cfg.channels) cfg.channels = {};
+          if (!cfg.channels.qqbot) cfg.channels.qqbot = {};
+          const target = $STREAM_VALUE;
+          if (cfg.channels.qqbot.streamSupport === target) process.exit(0);
+          cfg.channels.qqbot.streamSupport = target;
+          fs.writeFileSync('$APP_CONFIG', JSON.stringify(cfg, null, 4) + '\n');
+        " 2>&1; then
+            echo "  ✅ stream 配置成功（直接编辑配置文件）"
+        else
+            echo "  ⚠️  stream 配置设置失败，不影响后续运行"
+        fi
     fi
 fi
 
