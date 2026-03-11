@@ -1548,7 +1548,14 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     log?.info(`[qqbot:${account.accountId}] 💓 Keepalive suppressed: consecutive count ${count} reached limit ${MAX_KEEPALIVE_COUNT}, waiting for actual message to resume. sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
                     return;
                   }
-                  debugLog?.(`[qqbot:${account.accountId}] 💓 Sending stream keepalive (${count + 1}/${MAX_KEEPALIVE_COUNT}): sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}`);
+                  // streamId 为空时不发送心跳，直接停止（流式尚未真正建立，无需保活）
+                  const currentStreamId = senderAtRegistration.getContext().streamId;
+                  if (!currentStreamId) {
+                    log?.info(`[qqbot:${account.accountId}] 💓 Keepalive stopped: streamId is empty, sender=${senderAtRegistration.instanceId}`);
+                    clearKeepalive();
+                    return;
+                  }
+                  debugLog?.(`[qqbot:${account.accountId}] 💓 Sending stream keepalive (${count + 1}/${MAX_KEEPALIVE_COUNT}): sender=${senderAtRegistration.instanceId}, streamId=${currentStreamId}`);
                   sendingLock = true;
                   try {
                     // 三次检查：拿到锁后再确认一次（锁等待期间状态可能已变）
@@ -1559,7 +1566,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                     await streamSender.send("", false);
                     resetKeepalive(count + 1);
                   } catch (err) {
-                    log?.error(`[qqbot:${account.accountId}] 💓 Keepalive failed: sender=${senderAtRegistration.instanceId}, streamId=${senderAtRegistration.getContext().streamId}, error=${err}`);
+                    // 心跳发送失败：不停止流式（后续实际消息可能仍能发送），仅停止心跳
+                    log?.error(`[qqbot:${account.accountId}] 💓 Keepalive send failed, stopping keepalive (stream continues): sender=${senderAtRegistration.instanceId}, streamId=${currentStreamId}, error=${err}`);
+                    clearKeepalive();
                   } finally {
                     sendingLock = false;
                   }
