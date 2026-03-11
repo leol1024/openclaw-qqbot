@@ -464,10 +464,40 @@ fi
 echo ""
 echo "[6/7] 配置 stream 选项..."
 
-# 如果命令行未指定 --stream，但备份中有 streamSupport=true，则自动恢复
+# 如果命令行未指定 --stream，但备份中有 streamSupport 值，则自动恢复
 if [ -z "$STREAM" ] && [ "$SAVED_STREAM_SUPPORT" = "true" ]; then
     STREAM="yes"
     echo "自动恢复备份的 streamSupport=true 配置..."
+elif [ -z "$STREAM" ] && [ "$SAVED_STREAM_SUPPORT" = "false" ]; then
+    STREAM="no"
+    echo "自动恢复备份的 streamSupport=false 配置..."
+fi
+
+# 如果仍未指定，检查当前配置中是否有值；若没有则默认启用
+if [ -z "$STREAM" ]; then
+    CURRENT_STREAM_EXISTS=$(node -e "
+      const fs = require('fs');
+      const path = require('path');
+      const home = process.env.HOME;
+      for (const app of ['openclaw', 'clawdbot', 'moltbot']) {
+        const f = path.join(home, '.' + app, app + '.json');
+        if (!fs.existsSync(f)) continue;
+        try {
+          const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+          const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
+          for (const key of keys) {
+            const ch = cfg.channels && cfg.channels[key];
+            if (!ch) continue;
+            if (typeof ch.streamSupport === 'boolean') { process.stdout.write(String(ch.streamSupport)); process.exit(0); }
+          }
+        } catch {}
+      }
+    " 2>/dev/null || true)
+
+    if [ -z "$CURRENT_STREAM_EXISTS" ]; then
+        STREAM="yes"
+        echo "配置中未找到 stream 设置，默认启用流式消息..."
+    fi
 fi
 
 if [ -n "$STREAM" ]; then
