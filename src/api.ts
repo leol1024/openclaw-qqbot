@@ -124,14 +124,20 @@ async function doFetchToken(appId: string, clientSecret: string): Promise<string
   let rawBody: string;
   try {
     rawBody = await response.text();
-    // 隐藏 token 值，格式化打印
+    // 脱敏 token 值，格式化打印
     try {
       const parsed = JSON.parse(rawBody);
       const logParsed = { ...parsed };
-      if (logParsed.access_token) logParsed.access_token = "***";
+      if (typeof logParsed.access_token === "string" && logParsed.access_token.length > 6) {
+        logParsed.access_token = `${logParsed.access_token.slice(0, 6)}***`;
+      } else if (logParsed.access_token) {
+        logParsed.access_token = "***";
+      }
       apiLog.info(`[qqbot-api:${appId}] <<< Response Body: ${JSON.stringify(logParsed, null, 2)}`);
     } catch {
-      apiLog.info(`[qqbot-api:${appId}] <<< Response Body (raw): ${rawBody.slice(0, 2000)}`);
+      // raw body 也做脱敏：替换可能的 access_token 值
+      const sanitized = rawBody.replace(/"access_token"\s*:\s*"([^"]{6})[^"]*"/g, '"access_token":"$1***"');
+      apiLog.info(`[qqbot-api:${appId}] <<< Response Body (raw): ${sanitized.slice(0, 2000)}`);
     }
     data = JSON.parse(rawBody) as { access_token?: string; expires_in?: number };
   } catch (err) {
@@ -235,7 +241,17 @@ export async function apiRequest<T = unknown>(
 
   // 打印请求信息：方法、URL、请求头、请求体（JSON 格式化）
   apiLog.info(`[qqbot-api] >>> ${method} ${url} (timeout: ${timeout}ms)`);
-  apiLog.info(`[qqbot-api] >>> Headers: ${JSON.stringify(headers, null, 2)}`);
+  // 脱敏 Authorization 头（只显示前缀 + token 前6位 + ***）
+  const logHeaders = { ...headers };
+  if (logHeaders.Authorization) {
+    const parts = logHeaders.Authorization.split(" ");
+    if (parts.length === 2 && parts[1].length > 6) {
+      logHeaders.Authorization = `${parts[0]} ${parts[1].slice(0, 6)}***`;
+    } else {
+      logHeaders.Authorization = "***";
+    }
+  }
+  apiLog.info(`[qqbot-api] >>> Headers: ${JSON.stringify(logHeaders, null, 2)}`);
   if (body) {
     const logBody = { ...body } as Record<string, unknown>;
     // 脱敏：base64 文件数据只显示长度

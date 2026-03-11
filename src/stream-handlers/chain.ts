@@ -3,8 +3,9 @@
  *
  * 管理多个 StreamHandler，按注册顺序串联，提供两个核心方法：
  * - processBuffer：遍历 handler 的 canHandle → handle（主动处理）
- * - findSafeFlushPoint：管道模式，第一个 handler 算出截断上界，
- *   后续 handler 在上界范围内逐步收紧（被动阻断）
+ * - findSafeFlushPoint：门槛 + 通行检查模型，
+ *   第一个 handler（BracketSafeHandler）算出截断上界（门槛），
+ *   后续 handler 对 candidate 做全量验证（否决权），任一不通过则不发送
  */
 
 import type { StreamHandler, StreamHandlerContext, HandleResult } from "./types.js";
@@ -52,35 +53,41 @@ export class StreamHandlerChain {
   }
 
   /**
-   * 被动阻断：计算 buffer 的安全截断点（管道模式）
+   * 被动阻断：计算 buffer 的安全截断点（门槛 + 通行检查）
    *
-   * 串行执行各 handler 的 findSafePoint，形成逐步收紧的管道：
+   * 两阶段模型：
    *
-   * 1. 第一个 handler（BracketSafeHandler）对完整 buffer 计算截断上界
-   *    → 括号匹配通过才说明文本"可能"可以截断
-   * 2. 后续 handler 只对"准备发送的那段文本"（buffer[0..safePoint]）做检查
-   *    → 检查富媒体标签、payload 等，进一步收紧截断点
+   * 阶段一（门槛）：第一个 handler（BracketSafeHandler）对完整 buffer 计算截断上界
+   *   → 括号匹配通过才说明文本"可能"可以截断，返回 0 则整体不发送
    *
-   * 任何一步返回 0 即短路退出（不可截断，继续攒包）。
+   * 阶段二（通行检查）：后续 handler 对门槛范围内的 candidate 做全量检查
+   *   → 如果任意一个 handler 认为 candidate 不完全安全（返回值 < candidate.length），
+   *     则整体不发送（返回 0），等更多内容进来
+   *   → 只有全部后续 handler 都返回 candidate.length（全部通过），才放行
    *
-   * @returns 安全截断点（0 表示不安全，buffer.length 表示全部安全）
+   * 设计理念：后续 handler 不"收紧"截断点，而是拥有"否决权"。
+   * 要么 candidate 全发送，要么不发送继续攒包。
+   *
+   * @returns 安全截断点（0 表示不安全继续攒包，>0 表示可以截断发送）
    */
   findSafeFlushPoint(buffer: string): number {
     if (!buffer) return 0;
+    if (this.handlers.length === 0) return buffer.length;
 
-    let safePoint = buffer.length;
+    // 阶段一：门槛 —— 第一个 handler 算出截断上界
+    const gatekeeper = this.handlers[0];
+    const safePoint = gatekeeper.findSafePoint(buffer);
+    if (safePoint <= 0) return 0;
 
-    for (const handler of this.handlers) {
-      // 对当前截断范围内的文本做检查
-      const candidate = buffer.slice(0, safePoint);
+    // 阶段二：通行检查 —— 后续 handler 对 candidate 做全量验证
+    const candidate = buffer.slice(0, safePoint);
+    for (let i = 1; i < this.handlers.length; i++) {
+      const handler = this.handlers[i];
       const point = handler.findSafePoint(candidate);
-
-      if (point < safePoint) {
-        safePoint = point;
+      // 任意 handler 认为 candidate 不完全安全 → 否决，继续攒包
+      if (point < candidate.length) {
+        return 0;
       }
-
-      // 短路：截断点已收紧到 0，无需继续
-      if (safePoint <= 0) return 0;
     }
 
     return safePoint;

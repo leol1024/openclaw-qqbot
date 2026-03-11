@@ -1,18 +1,19 @@
 /**
- * BracketSafeHandler —— 括号安全截断处理器（必过校验）
+ * BracketSafeHandler —— 括号安全截断处理器（门槛）
  *
- * 作为责任链中 findSafePoint 的第一道关卡：
- * - 括号匹配 ()[]{}<> 平衡检测
+ * 作为责任链中 findSafeFlushPoint 的门槛角色：
+ * - 对完整 buffer 做括号匹配 ()[]{}<> 平衡检测
  * - 换行符优先切割
  * - [xxx] 结尾保护（防止 MD 链接被截断）
  * - 假 MD 链接清除
  * - XML 自闭合标签跟随
  * - Markdown 引用 > 特殊处理
+ * - 算出截断上界，后续 handler 对 candidate 做通行检查
  *
- * 只做括号层面的安全截断，算出截断上界。
- * 后续 handler（MediaTag、Payload 等）在此上界范围内进一步收紧。
- *
- * 移植自 babyQ fmtx.go 的 SplitMsg 算法。
+ * 门槛模型：
+ * - BracketSafeHandler 先算出括号安全的截断点（上界）
+ * - 后续 handler 对 candidate 做全量验证，任一否决则整体不发送
+ * - 后续 handler 不"收紧"截断点，而是拥有"否决权"
  */
 
 import type { StreamHandler, StreamHandlerContext, HandleResult } from "./types.js";

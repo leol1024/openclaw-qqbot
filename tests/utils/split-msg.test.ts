@@ -1,11 +1,10 @@
 /**
  * split-msg.test.ts —— splitMsg 核心算法单元测试
  *
- * 移植自 babyQ fmtx_test.go 的全部测试用例：
- * - TestSplitMsg（无 waitSeparator 模式）
- * - TestSplitMsgWithWaitSeparator（有 waitSeparator 模式）
- *
- * 并增加 qqbot 特有场景的测试。
+ * 覆盖场景：
+ * - 无 waitSeparator 模式
+ * - 有 waitSeparator 模式
+ * - qqbot 特有场景
  */
 
 import { describe, it, expect } from "vitest";
@@ -15,43 +14,8 @@ import {
   findLastNewline,
   splitMsgByBracket,
   checkMdLink,
-  removeFakeMdLinks,
   type SplitMsgConfig,
 } from "../../src/utils/split-msg.js";
-
-// ============ removeFakeMdLinks 测试 ============
-
-describe("removeFakeMdLinks", () => {
-  it("应保留 http:// 链接", () => {
-    const input = "[百度](http://www.baidu.com)";
-    expect(removeFakeMdLinks(input)).toBe(input);
-  });
-
-  it("应保留 https:// 链接", () => {
-    const input = "[Google](https://www.google.com)";
-    expect(removeFakeMdLinks(input)).toBe(input);
-  });
-
-  it("应删除非 http 的假 md 链接", () => {
-    const input = "[文本](not-a-url)";
-    expect(removeFakeMdLinks(input)).toBe("文本");
-  });
-
-  it("应删除 ftp 协议的假 md 链接", () => {
-    const input = "[文件](ftp://server/file)";
-    expect(removeFakeMdLinks(input)).toBe("文件");
-  });
-
-  it("应同时处理多个链接", () => {
-    const input = "[真链接](https://example.com) 和 [假链接](fake-url)";
-    expect(removeFakeMdLinks(input)).toBe("[真链接](https://example.com) 和 假链接");
-  });
-
-  it("无链接时返回原文", () => {
-    const input = "这是一段普通文本";
-    expect(removeFakeMdLinks(input)).toBe(input);
-  });
-});
 
 // ============ findLastNewline 测试 ============
 
@@ -256,7 +220,7 @@ describe("splitMsg (waitSeparator=true, 默认模式)", () => {
   });
 });
 
-// ============ 超长文本的分割测试（对应 babyQ 的测试断句05-07） ============
+// ============ 超长文本的分割测试 ============
 
 describe("splitMsg 超长文本 (waitSeparator=true)", () => {
   // 构造超长文本用于测试的辅助函数
@@ -392,17 +356,17 @@ describe("splitMsg 边界情况", () => {
     expect(result.waitMsg).toBe("(");
   });
 
-  it("假 MD 链接被清除后的分割 (waitSeparator=false)", () => {
+  it("MD 锚点链接保留原样 (waitSeparator=false)", () => {
     const result = splitMsg("[引用1](@ref)一些文本", { waitSeparator: false });
-    // [引用1](@ref) 会被清除为 "引用1"，变成 "引用1一些文本"
-    expect(result.sendMsg).toBe("引用1一些文本");
+    // 不再清除假 MD 链接，[引用1](@ref) 括号平衡，整段可发送
+    expect(result.sendMsg).toBe("[引用1](@ref)一些文本");
   });
 
-  it("假 MD 链接被清除后 (waitSeparator=true) —— 短文本继续等待", () => {
+  it("MD 锚点链接保留原样 (waitSeparator=true) —— 短文本继续等待", () => {
     const result = splitMsg("[引用1](@ref)一些文本");
-    // 清除后 "引用1一些文本" 只有 8 字符，小于 waitSeparatorMaxRunes，继续等待
+    // 不再清除假 MD 链接，但 12 字符小于 waitSeparatorMaxRunes(100)，继续等待
     expect(result.sendMsg).toBe("");
-    expect(result.waitMsg).toBe("引用1一些文本");
+    expect(result.waitMsg).toBe("[引用1](@ref)一些文本");
   });
 
   it("splitFail 超长文本无分割点", () => {

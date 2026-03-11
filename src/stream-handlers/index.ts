@@ -16,21 +16,16 @@ import { BracketSafeHandler } from "./bracket-safe-handler.js";
 /**
  * 创建默认的处理器责任链
  *
- * findSafePoint 注册顺序（管道模式，逐步收紧截断点）：
- * 1. BracketSafeHandler  — 括号匹配 + 换行优先，算出截断上界（必过校验）
- * 2. MediaTagHandler     — 在上界范围内检查富媒体标签，进一步收紧
- * 3. PayloadHandler      — 在上界范围内检查 QQBOT_PAYLOAD，进一步收紧
+ * findSafePoint 门槛 + 通行检查模型：
+ * 1. BracketSafeHandler  — 括号匹配 + 换行优先，算出截断上界（门槛）
+ * 2. PayloadHandler      — 对 candidate 做通行检查，包含 QQBOT_PAYLOAD 则否决
+ * 3. MediaTagHandler     — 对 candidate 做通行检查，包含未闭合/完整媒体标签则否决
+ *    → 任一后续 handler 否决 → 返回 0 继续攒包，等更多内容
  *
  * processBuffer 注册顺序（主动处理，先注册的先检查）：
- * 1. PayloadHandler      — QQBOT_PAYLOAD 拦截（最高优先级，abort 整个链）
- * 2. MediaTagHandler     — 完整富媒体标签处理
- * 3. BracketSafeHandler  — 不主动处理（canHandle 始终 false）
- *
- * 注意：processBuffer 按注册顺序遍历，但 BracketSafeHandler.canHandle=false，
- * 所以它在 processBuffer 中不会被执行。PayloadHandler 和 MediaTagHandler
- * 的 processBuffer 顺序由它们在数组中的位置决定。
- * 为了兼顾两个流程，这里用注册顺序让 findSafePoint 管道正确工作，
- * processBuffer 中 BracketSafeHandler 自然跳过。
+ * 1. BracketSafeHandler  — 不主动处理（canHandle 始终 false），自然跳过
+ * 2. PayloadHandler      — QQBOT_PAYLOAD 拦截（最高优先级，abort 整个链）
+ * 3. MediaTagHandler     — 完整富媒体标签处理
  */
 export function createDefaultChain(): StreamHandlerChain {
   const chain = new StreamHandlerChain();

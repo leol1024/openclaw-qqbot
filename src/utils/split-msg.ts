@@ -1,15 +1,13 @@
 /**
  * split-msg.ts —— 核心攒包拆分算法
  *
- * 移植自 babyQ fmtx.go 的 SplitMsg / findBestSplitIndex / removeFakeMdLinks / splitMsgByBracket 逻辑。
  *
  * 功能概述：
  * 1. 括号匹配安全截断 —— 使用栈算法检测 ()[]{}<> 的平衡状态
  * 2. 换行符优先切割 —— buffer 内有换行时优先从最后一个换行处截断
  * 3. [xxx] 结尾保护 —— 防止 [text](url) 被从中间切断
- * 4. 假 MD 链接清除 —— [text](非http链接) → text
- * 5. XML 自闭合标签跟随 —— 分隔符后紧跟的连续自闭合标签一起发送
- * 6. Markdown 引用 > 特殊处理 —— 栈为空时 > 不当作右尖括号
+ * 4. XML 自闭合标签跟随 —— 分隔符后紧跟的连续自闭合标签一起发送
+ * 5. Markdown 引用 > 特殊处理 —— 栈为空时 > 不当作右尖括号
  */
 
 // ============ 配置 ============
@@ -50,14 +48,8 @@ const DEFAULT_MAX_SLICE_BYTES_LEN = 4000;
 /** 匹配连续自闭合 XML/HTML 标签（例如 <tag ... /><tag ... />） */
 const TAG_PATTERN = /^(?:<[^>]+\/>)+/;
 
-/** 匹配 Markdown 链接格式 [text](url) */
-const MD_URL_RE = /\[(.*?)\]\((.*?)\)/g;
-
 /** 匹配以中括号 [xxx] 结尾的表达式 */
 const BRACKET_REGEX = /(\[[^\]]+\])$/;
-
-const PROTOCOL_HTTP = 'http://';
-const PROTOCOL_HTTPS = 'https://';
 
 // ============ 括号映射 ============
 
@@ -84,18 +76,12 @@ interface SplitMsgOptions {
 /**
  * 拆分消息，返回 sendMsg 和 waitMsg
  *
- * 移植自 babyQ fmtx.go SplitMsg
- *
  * 流程：
- * 1. removeFakeMdLinks 删除假 MD 链接
- * 2. 取前 maxSliceLength 字符范围
- * 3. findBestSplitIndex 找最佳分割点
- * 4. splitMsgByBracket [xxx] 结尾保护
+ * 1. 取前 maxSliceLength 字符范围
+ * 2. findBestSplitIndex 找最佳分割点
+ * 3. splitMsgByBracket [xxx] 结尾保护
  */
 export function splitMsg(msg: string, config?: SplitMsgConfig): SplitResult {
-  // 删除假的 md 链接
-  msg = removeFakeMdLinks(msg);
-
   if (msg.length === 0) {
     return { sendMsg: '', waitMsg: '' };
   }
@@ -140,8 +126,6 @@ export function splitMsg(msg: string, config?: SplitMsgConfig): SplitResult {
 
 /**
  * 找最佳分割点
- *
- * 移植自 babyQ fmtx.go findBestSplitIndex
  *
  * 算法流程：
  * 1. 优先找最后一个换行符
@@ -226,8 +210,6 @@ export function findBestSplitIndex(runes: string[], opts: SplitMsgOptions): numb
 
 /**
  * 找最后一个换行符的位置（返回换行符后一个位置）
- *
- * 移植自 babyQ fmtx.go findLastNewline
  */
 export function findLastNewline(runes: string[]): number {
   for (let i = runes.length - 1; i >= 0; i--) {
@@ -242,9 +224,7 @@ export function findLastNewline(runes: string[]): number {
  * 根据中括号切割消息
  *
  * 如果消息以 "[xxx]" 结尾，则把 "[xxx]" 切割到 waitMsg，
- * 防止 md 链接语法 [text](url) 被分割开导致检测不到假的 md 链接
- *
- * 移植自 babyQ fmtx.go splitMsgByBracket
+ * 防止 md 链接语法 [text](url) 被从中间切断
  */
 export function splitMsgByBracket(msg: string): { sendMsg: string; waitMsg: string } {
   // 不是以 "]" 结尾，直接返回
@@ -268,8 +248,6 @@ export function splitMsgByBracket(msg: string): { sendMsg: string; waitMsg: stri
 
 /**
  * 校验 MD 格式 —— 检查括号是否平衡
- *
- * 移植自 babyQ fmtx.go CheckMdLink
  */
 export function checkMdLink(mdTxt: string): boolean {
   const stack: string[] = [];
@@ -300,26 +278,3 @@ export function checkMdLink(mdTxt: string): boolean {
   return stack.length === 0;
 }
 
-/**
- * 删除假的 md 链接
- *
- * [text](非http链接) → 只保留 text
- *
- * 移植自 babyQ fmtx.go removeFakeMdLinks
- */
-export function removeFakeMdLinks(text: string): string {
-  // 需要每次重置 lastIndex（使用全局正则）
-  const re = new RegExp(MD_URL_RE.source, 'g');
-  if (!re.test(text)) {
-    return text;
-  }
-
-  // 重置后再做替换
-  const replaceRe = new RegExp(MD_URL_RE.source, 'g');
-  return text.replace(replaceRe, (match, linkText: string, url: string) => {
-    if (url.startsWith(PROTOCOL_HTTP) || url.startsWith(PROTOCOL_HTTPS)) {
-      return match; // 保留原链接
-    }
-    return linkText; // 只保留文字
-  });
-}
