@@ -797,7 +797,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         const hasAsrReferFallback = voiceTranscriptSources.includes("asr");
         if (voiceTranscripts.length > 0) {
           voiceText = voiceTranscripts.length === 1
-            ? `${voiceTranscriptSources[0] === "asr" ? "[语音消息(ASR兜底，可能不准确)]" : "[语音消息]"} ${voiceTranscripts[0]}`
+            ? `${voiceTranscriptSources[0] === "asr" ? "[语音消息]" : "[语音消息]"} ${voiceTranscripts[0]}`
             : voiceTranscripts.map((t, i) => {
                 const prefix = voiceTranscriptSources[i] === "asr"
                   ? `[语音${i + 1}(ASR兜底，可能不准确)]`
