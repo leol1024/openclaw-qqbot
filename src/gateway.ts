@@ -826,7 +826,12 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
 
         // 解析 QQ 表情标签，将 <faceType=...,ext="base64"> 替换为 【表情: 中文名】
-        const parsedContent = parseFaceTags(event.content);
+        let parsedContent = parseFaceTags(event.content);
+        // 清理 QQ 平台注入的 ASR 兜底说明文本（如 "ASR兜底，可能不准确"）
+        parsedContent = parsedContent
+          .replace(/[\[【\(（]?\s*ASR\s*兜底[^】\]\)）\n]*[\]】\)）]?\s*/gi, "")
+          .replace(/[，,]?\s*可能不准确\s*/g, "")
+          .trim();
         const userContent = voiceText
           ? (parsedContent.trim() ? `${parsedContent}\n${voiceText}` : voiceText) + attachmentInfo
           : parsedContent + attachmentInfo;
