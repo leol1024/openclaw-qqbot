@@ -25,7 +25,7 @@ import {
   type MessageResponse,
 } from "./api.js";
 import { isAudioFile, audioFileToSilkBase64, waitForFile } from "./utils/audio-convert.js";
-import { normalizeMediaTags, parseMediaTags } from "./utils/media-tags.js";
+import { normalizeMediaTags, parseMediaTags, filterInternalMarkers } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName } from "./utils/platform.js";
 
@@ -300,7 +300,7 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   // 预处理：纠正小模型常见的标签拼写错误和格式问题
   text = normalizeMediaTags(text);
   
-  const { hasMedia, sendQueue } = parseMediaTags(text);
+  const { hasMedia, sendQueue } = parseMediaTags(text, filterInternalMarkers);
   
   if (hasMedia) {
     console.log(`[qqbot] sendText: Detected ${sendQueue.filter(i => i.type !== "text").length} media tag(s), processing...`);
@@ -1301,7 +1301,7 @@ export async function sendCronMessage(
 export class StreamSender {
   private context: StreamContext;
   private accessToken: string | null = null;
-  private targetType: "c2c" | "group" | "channel";
+  private targetType: "c2c" | "group" | "channel" | "dm";
   private targetId: string;
   private msgId?: string;
   private account: ResolvedQQBotAccount;
@@ -1403,6 +1403,22 @@ export class StreamSender {
           channel: "qqbot", 
           messageId: groupResult.id, 
           timestamp: groupResult.timestamp 
+        };
+      } else if (this.targetType === "dm") {
+        // 频道私信不支持流式，降级为普通消息
+        const dmResult = await sendDmMessage(
+          this.accessToken,
+          this.targetId,
+          text,
+          this.msgId
+        );
+        if (isEnd) {
+          this.context.ended = true;
+        }
+        return { 
+          channel: "qqbot", 
+          messageId: dmResult.id, 
+          timestamp: dmResult.timestamp 
         };
       } else {
         // 频道不支持流式，降级为普通消息

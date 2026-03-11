@@ -211,7 +211,7 @@ export function decodeMediaPath(rawPath: string): string {
 }
 
 /** 标签名 → 发送队列项类型 */
-function tagNameToQueueType(tagName: string): MediaSendQueueItemType {
+export function tagNameToQueueType(tagName: string): MediaSendQueueItemType {
   switch (tagName) {
     case "qqvoice": return "voice";
     case "qqvideo": return "video";
@@ -379,4 +379,26 @@ export function findMediaTagSafePoint(text: string): number {
 
   // 全部安全
   return len;
+}
+
+// ============ 内部标记过滤 ============
+
+/**
+ * 过滤内部标记（如 [[reply_to: xxx]]）
+ * 这些标记可能被 AI 错误地学习并输出，需要在发送前移除。
+ *
+ * sendText（outbound.ts）和 deliver / processMediaInBuffer（gateway.ts）
+ * 共享此过滤逻辑。
+ */
+export function filterInternalMarkers(text: string): string {
+  if (!text) return text;
+
+  // 过滤 [[xxx: yyy]] 格式的内部标记
+  // 例如: [[reply_to: ROBOT1.0_kbc...]]
+  let result = text.replace(/\[\[[a-z_]+:\s*[^\]]*\]\]/gi, "");
+
+  // 清理可能产生的多余空行
+  result = result.replace(/\n{3,}/g, "\n\n").trim();
+
+  return result;
 }
