@@ -1628,6 +1628,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             }
           };
 
+          // 标记 handlePartialReply 因 streamEnded/streamFailed 跳过时是否已打过日志（每轮流式重置）
+          let partialReplySkipLogged = false;
+
           /**
            * 重建 StreamSender，用于中断后继续发送后续流式内容
            */
@@ -1637,6 +1640,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             streamSender = createStreamSender(account, targetTo, event.messageId, streamLog);
             streamStarted = false;
             streamEnded = false;
+            partialReplySkipLogged = false; // 新一轮流式，重置日志标记
             log?.info(`[qqbot:${account.accountId}] 🔄 StreamSender rebuilt: old=[${oldInstanceId}|streamId=${oldStreamId}] → new=[${streamSender.instanceId}]`);
           };
 
@@ -1742,6 +1746,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
               streamSender = createStreamSender(account, targetTo, event.messageId, streamLog);
               streamStarted = false;
               streamEnded = false;
+              partialReplySkipLogged = false; // 新一轮流式，重置日志标记
               log?.info(`[qqbot:${account.accountId}] 🔄 [handler] StreamSender rebuilt: old=[${oldInstanceId}|streamId=${oldStreamId}] → new=[${streamSender.instanceId}]`);
             },
             sendMediaByType,
@@ -1849,8 +1854,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
           const handlePartialReply = supportsStream ? async (payload: { text?: string }) => {
             if (!streamSender || streamEnded || streamFailed) {
-              if (streamEnded || streamFailed) {
-                log?.info(`[qqbot:${account.accountId}] handlePartialReply skipped: sender=${streamSender?.instanceId ?? "null"}, streamEnded=${streamEnded}, streamFailed=${streamFailed}`);
+              if ((streamEnded || streamFailed) && !partialReplySkipLogged) {
+                partialReplySkipLogged = true;
+                log?.info(`[qqbot:${account.accountId}] handlePartialReply skipped (first occurrence, suppressing further): sender=${streamSender?.instanceId ?? "null"}, streamEnded=${streamEnded}, streamFailed=${streamFailed}`);
               }
               return;
             }
