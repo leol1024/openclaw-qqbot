@@ -119,7 +119,7 @@ export function resolveQQBotAccount(
     systemPrompt: accountConfig.systemPrompt,
     imageServerBaseUrl: accountConfig.imageServerBaseUrl || process.env.QQBOT_IMAGE_SERVER_BASE_URL,
     markdownSupport: accountConfig.markdownSupport !== false,
-    streamSupport: accountConfig.streamSupport === true,
+    streamSupport: accountConfig.streamSupport !== false,
     config: accountConfig,
   };
 }
