@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Mock api.ts 的所有远程调用
 vi.mock("../src/api.js", () => ({
   getAccessToken: vi.fn().mockResolvedValue("mock-access-token"),
-  sendC2CMessage: vi.fn().mockResolvedValue({ id: "msg-001", timestamp: 1700000000, stream_id: "stream-abc" }),
+  sendC2CMessage: vi.fn().mockResolvedValue({ id: "stream-abc", timestamp: 1700000000 }),
   sendGroupMessage: vi.fn().mockResolvedValue({ id: "grp-001", timestamp: "2024-01-01T00:00:00Z" }),
   sendChannelMessage: vi.fn().mockResolvedValue({ id: "ch-001", timestamp: "2024-01-01T00:00:00Z" }),
   getNextMsgSeq: vi.fn().mockReturnValue(12345),
@@ -119,7 +119,7 @@ describe("StreamSender", () => {
       const sender = new StreamSender(mockAccount, "c2c:user123", "msg-001");
       const result = await sender.send("Hello");
       expect(result.streamId).toBe("stream-abc");
-      expect(result.messageId).toBe("msg-001");
+      expect(result.messageId).toBe("stream-abc");
     });
   });
 

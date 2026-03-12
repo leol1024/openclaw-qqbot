@@ -1357,6 +1357,13 @@ export class StreamSender {
 
       // 仅 C2C 支持流式
       if (this.targetType === "c2c") {
+        // streamId 为空说明流式尚未建立（服务端未返回 stream_id），发送结束分片无意义，直接跳过
+        if (isEnd && !this.context.streamId) {
+          this.log?.info(`[StreamSender:${this.instanceId}] ⏭️ Skipping END chunk: streamId is empty (index=${this.context.index}), stream was not established`);
+          this.context.ended = true;
+          return { channel: "qqbot" };
+        }
+
         const streamConfig = {
           state: isEnd ? StreamState.END : StreamState.STREAMING,
           index: this.context.index,
@@ -1372,14 +1379,10 @@ export class StreamSender {
         );
 
         // 更新流式上下文
-        // 第一次发送后，服务端会返回 stream_id，后续需要带上
-        if (this.context.index === 0 && result.stream_id) {
-          this.context.streamId = result.stream_id;
-          this.log?.info(`[StreamSender:${this.instanceId}] Got streamId from server: ${this.context.streamId}`);
-        } else if (this.context.index === 0 && result.id && !this.context.streamId) {
-          // 某些情况下 stream_id 可能在 id 字段返回
+        // 只有发起流式的请求（携带 stream 且 state=STREAMING(1)），返回值中的 id 才是流式 ID
+        if (streamConfig.state === StreamState.STREAMING && this.context.index === 0 && result.id) {
           this.context.streamId = result.id;
-          this.log?.info(`[StreamSender:${this.instanceId}] Got streamId from result.id: ${this.context.streamId}`);
+          this.log?.info(`[StreamSender:${this.instanceId}] Got streamId from server: ${this.context.streamId}`);
         }
 
         this.context.index++;

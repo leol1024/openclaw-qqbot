@@ -357,8 +357,6 @@ export async function getGatewayUrl(accessToken: string): Promise<string> {
 export interface MessageResponse {
   id: string;
   timestamp: number | string;
-  /** 流式消息ID，用于后续分片 */
-  stream_id?: string;
 }
 
 function buildMessageBody(
