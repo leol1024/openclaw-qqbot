@@ -95,12 +95,16 @@ export class MediaTagHandler implements StreamHandler {
 
           if (isHttpUrl && ctx.sendImageAsMarkdown) {
             // 公网 URL → markdown 图片嵌入流式（不中断）
-            const success = await ctx.sendImageAsMarkdown(imagePath);
-            if (!success) {
-              ctx.streamFailed = true;
-              return { handled: true, newBuffer: ctx.buffer.slice(lastIndex), abort: true };
+            try {
+              const success = await ctx.sendImageAsMarkdown(imagePath);
+              if (success) {
+                ctx.streamStarted = true;
+              } else {
+                ctx.log?.error(`[qqbot:${ctx.accountId}] [MediaTagHandler] sendImageAsMarkdown failed for ${imagePath}, skipping`);
+              }
+            } catch (err) {
+              ctx.log?.error(`[qqbot:${ctx.accountId}] [MediaTagHandler] sendImageAsMarkdown error for ${imagePath}: ${err}`);
             }
-            ctx.streamStarted = true;
           } else if (isLocalPath) {
             // 本地图片 → 中断流式 → 富媒体 API → 重建
             await ctx.interruptStream();

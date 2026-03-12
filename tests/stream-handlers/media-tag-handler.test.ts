@@ -119,15 +119,64 @@ describe("MediaTagHandler.handle — 图片", () => {
     expect(ctx.sendImageAsMarkdown).not.toHaveBeenCalled();
   });
 
-  it("sendImageAsMarkdown 失败时标记 streamFailed 并返回 abort", async () => {
+  it("sendImageAsMarkdown 失败时跳过该图片，不 abort 后续处理", async () => {
     const ctx = createMockContext("<qqimg>https://example.com/fail.png</qqimg>", {
       sendImageAsMarkdown: vi.fn().mockResolvedValue(false),
     });
     const result = await handler.handle(ctx);
 
     expect(result.handled).toBe(true);
-    expect(result.abort).toBe(true);
-    expect(ctx.streamFailed).toBe(true);
+    // 不再 abort，允许后续图片继续处理
+    expect(result.abort).toBeUndefined();
+    expect(ctx.streamFailed).toBe(false);
+  });
+
+  it("sendImageAsMarkdown 抛异常时跳过该图片，不 abort 后续处理", async () => {
+    const ctx = createMockContext("<qqimg>https://example.com/error.png</qqimg>", {
+      sendImageAsMarkdown: vi.fn().mockRejectedValue(new Error("API 限频")),
+    });
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(result.abort).toBeUndefined();
+    expect(ctx.streamFailed).toBe(false);
+    // 记录了错误日志
+    expect(ctx.log!.error).toHaveBeenCalled();
+  });
+
+  it("5 张图片中间某张失败 → 跳过失败的，其余继续发送", async () => {
+    const urls = [
+      "https://picsum.photos/800/600?random=100",
+      "https://picsum.photos/800/600?random=101",  // 这张会失败
+      "https://picsum.photos/800/600?random=102",
+      "https://picsum.photos/800/600?random=103",  // 这张也会失败
+      "https://picsum.photos/800/600?random=104",
+    ];
+    const buffer = urls.map(url => `<qqimg>${url}</qqimg>`).join("\n\n");
+
+    let callCount = 0;
+    const ctx = createMockContext(buffer, {
+      sendImageAsMarkdown: vi.fn(async (_path: string): Promise<boolean> => {
+        callCount++;
+        // 第 2 和第 4 张失败
+        if (callCount === 2 || callCount === 4) return false;
+        return true;
+      }),
+    });
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(result.abort).toBeUndefined();
+    expect(ctx.streamFailed).toBe(false);
+    // 5 张都尝试了
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledTimes(5);
+    for (const url of urls) {
+      expect(ctx.sendImageAsMarkdown).toHaveBeenCalledWith(url);
+    }
+    // 失败的 2 张记录了错误日志
+    expect(ctx.log!.error).toHaveBeenCalledTimes(2);
+    expect(result.newBuffer).toBe("");
   });
 
   it("sendImageAsMarkdown 不存在时，公网图片不会调用（跳过处理）", async () => {
@@ -634,6 +683,95 @@ describe("MediaTagHandler — 公网图片 URL → markdown 图片输出", () =>
     expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(1);
     const sentText = (ctx.sendStreamChunk as any).mock.calls[0][0] as string;
     expect(sentText).toBe(`\n![#640px #480px](${url})\n`);
+  });
+
+  it("5 个公网图片用换行分隔 → 全部处理，每个都发送 markdown 图片", async () => {
+    const urls = [
+      "https://picsum.photos/800/600?random=100",
+      "https://picsum.photos/800/600?random=101",
+      "https://picsum.photos/800/600?random=102",
+      "https://picsum.photos/800/600?random=103",
+      "https://picsum.photos/800/600?random=104",
+    ];
+    // 模拟 AI 生成的消息：每个图片标签之间用 \n\n 分隔
+    const buffer = urls
+      .map(url => `<qqimg>${url}</qqimg>`)
+      .join("\n\n");
+    const ctx = createContextWithRealMarkdown(buffer, { width: 800, height: 600 });
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    // 5 个公网图片 → sendImageAsMarkdown 调用 5 次
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledTimes(5);
+    for (const url of urls) {
+      expect(ctx.sendImageAsMarkdown).toHaveBeenCalledWith(url);
+    }
+    // 不中断流式（公网图片走 markdown 嵌入）
+    expect(ctx.interruptStream).not.toHaveBeenCalled();
+    expect(ctx.sendMediaByType).not.toHaveBeenCalled();
+
+    // sendStreamChunk 调用次数：
+    // 图片1（无前缀文字） + 图片间的换行文字4次 + 图片5次 = 最多 9 次
+    // 但 "\n\n" trim() 后为空，所以换行文字会被跳过
+    // 实际只有 5 次（每个图片的 markdown）
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(5);
+
+    // 验证每个图片的 markdown 格式
+    const calls = (ctx.sendStreamChunk as any).mock.calls;
+    for (let i = 0; i < 5; i++) {
+      expect(calls[i][0]).toBe(`\n![#800px #600px](${urls[i]})\n`);
+    }
+
+    // 最后一个标签后没有剩余文本
+    expect(result.newBuffer).toBe("");
+  });
+
+  it("5 个公网图片用换行分隔 + 简单 mock → 全部发送 sendImageAsMarkdown", async () => {
+    const urls = [
+      "https://picsum.photos/800/600?random=100",
+      "https://picsum.photos/800/600?random=101",
+      "https://picsum.photos/800/600?random=102",
+      "https://picsum.photos/800/600?random=103",
+      "https://picsum.photos/800/600?random=104",
+    ];
+    const buffer = urls
+      .map(url => `<qqimg>${url}</qqimg>`)
+      .join("\n\n");
+    const ctx = createMockContext(buffer);
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledTimes(5);
+    for (const url of urls) {
+      expect(ctx.sendImageAsMarkdown).toHaveBeenCalledWith(url);
+    }
+    // 换行间隔 trim() 后为空 → 不发送文本块
+    expect(ctx.sendStreamChunk).not.toHaveBeenCalled();
+    // 不走中断流式路径
+    expect(ctx.interruptStream).not.toHaveBeenCalled();
+    expect(result.newBuffer).toBe("");
+  });
+
+  it("5 个公网图片 + 图片间有文字描述 → 文字和图片交替发送", async () => {
+    const buffer =
+      "第一张：<qqimg>https://picsum.photos/800/600?random=100</qqimg>\n\n" +
+      "第二张：<qqimg>https://picsum.photos/800/600?random=101</qqimg>\n\n" +
+      "第三张：<qqimg>https://picsum.photos/800/600?random=102</qqimg>";
+    const ctx = createMockContext(buffer);
+
+    const result = await handler.handle(ctx);
+
+    expect(result.handled).toBe(true);
+    // 3 张图片
+    expect(ctx.sendImageAsMarkdown).toHaveBeenCalledTimes(3);
+    // 3 段文字（"第一张："、"\n\n第二张："、"\n\n第三张："）
+    expect(ctx.sendStreamChunk).toHaveBeenCalledTimes(3);
+    expect(ctx.sendStreamChunk).toHaveBeenCalledWith("第一张：", false);
+    // 不中断流式
+    expect(ctx.interruptStream).not.toHaveBeenCalled();
+    expect(result.newBuffer).toBe("");
   });
 
   it("图片 URL 后有剩余文字 → markdown 图片发出后，剩余文字留在 buffer", async () => {

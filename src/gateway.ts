@@ -398,9 +398,17 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   // 不同用户的消息并行处理（互不阻塞）。
   const userQueues = new Map<string, QueuedMessage[]>(); // peerId → 消息队列
   const activeUsers = new Set<string>(); // 正在处理中的用户
+  const activeUserStartTimes = new Map<string, number>(); // peerId → 开始处理的时间戳
   let messagesProcessed = 0;
   let handleMessageFnRef: ((msg: QueuedMessage) => Promise<void>) | null = null;
   let totalEnqueued = 0; // 全局已入队总数（用于溢出保护）
+
+  // 单消息处理的绝对超时（5分钟，涵盖 dispatch 120s + sendingLock 30s + 流式结束 + 缓冲）
+  const DRAIN_MESSAGE_TIMEOUT = 5 * 60 * 1000;
+  // activeUsers 健康检查间隔（每 60 秒检查一次）
+  const ACTIVE_USERS_HEALTH_CHECK_INTERVAL = 60 * 1000;
+  // activeUsers 过期阈值（超过 10 分钟视为泄漏）
+  const ACTIVE_USER_STALE_THRESHOLD = 10 * 60 * 1000;
 
   // 获取消息的路由 key（决定并发隔离粒度）
   const getMessagePeerId = (msg: QueuedMessage): string => {
@@ -408,6 +416,43 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     if (msg.type === MSG_TYPE_GROUP) return `group:${msg.groupOpenid ?? "unknown"}`;
     return `dm:${msg.senderId}`;
   };
+
+  // ============ activeUsers 健康检查 & 定期清理 ============
+  // 防止因为异常导致 activeUsers 永远不被清理，阻塞后续消息处理
+  const activeUsersHealthCheck = (): void => {
+    if (activeUsers.size === 0) return;
+    const now = Date.now();
+    const staleUsers: string[] = [];
+    for (const peerId of activeUsers) {
+      const startTime = activeUserStartTimes.get(peerId);
+      if (!startTime || now - startTime > ACTIVE_USER_STALE_THRESHOLD) {
+        staleUsers.push(peerId);
+      }
+    }
+    if (staleUsers.length > 0) {
+      log?.error(`[qqbot:${account.accountId}] ⚠️ activeUsers health check: found ${staleUsers.length} stale user(s): ${staleUsers.join(", ")}. Force-cleaning.`);
+      for (const peerId of staleUsers) {
+        activeUsers.delete(peerId);
+        activeUserStartTimes.delete(peerId);
+        userQueues.delete(peerId);
+        log?.error(`[qqbot:${account.accountId}] ⚠️ Force-removed stale activeUser: ${peerId}`);
+      }
+      // 清理后尝试唤醒等待中的用户
+      for (const [waitingPeerId, waitingQueue] of userQueues) {
+        if (waitingQueue.length > 0 && !activeUsers.has(waitingPeerId)) {
+          drainUserQueue(waitingPeerId);
+          break;
+        }
+      }
+    }
+  };
+
+  // 启动定期健康检查
+  const healthCheckTimer = setInterval(() => {
+    if (!isAborted) {
+      activeUsersHealthCheck();
+    }
+  }, ACTIVE_USERS_HEALTH_CHECK_INTERVAL);
 
   const enqueueMessage = (msg: QueuedMessage): void => {
     const peerId = getMessagePeerId(msg);
@@ -451,14 +496,25 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
 
     activeUsers.add(peerId);
+    activeUserStartTimes.set(peerId, Date.now());
 
     try {
       while (queue.length > 0 && !isAborted) {
         const msg = queue.shift()!;
         totalEnqueued = Math.max(0, totalEnqueued - 1);
+        // 更新 start time（每处理一条消息重置，用于健康检查判断是否卡住）
+        activeUserStartTimes.set(peerId, Date.now());
         try {
           if (handleMessageFnRef) {
-            await handleMessageFnRef(msg);
+            // 为单条消息处理添加超时保护：防止 handleMessage 永久挂起
+            await Promise.race([
+              handleMessageFnRef(msg),
+              new Promise<void>((_, reject) => {
+                setTimeout(() => {
+                  reject(new Error(`Single message processing timeout (${DRAIN_MESSAGE_TIMEOUT}ms) for ${peerId}, msgId=${msg.messageId}`));
+                }, DRAIN_MESSAGE_TIMEOUT);
+              }),
+            ]);
             messagesProcessed++;
           }
         } catch (err) {
@@ -467,6 +523,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       }
     } finally {
       activeUsers.delete(peerId);
+      activeUserStartTimes.delete(peerId);
       userQueues.delete(peerId);
       // 处理完后，检查是否有等待并发槽位的用户
       for (const [waitingPeerId, waitingQueue] of userQueues) {
@@ -489,6 +546,8 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    // 清理 activeUsers 健康检查定时器
+    clearInterval(healthCheckTimer);
     cleanup();
     // P1-1: 停止后台 Token 刷新
     stopBackgroundTokenRefresh(account.appId);
@@ -1490,12 +1549,28 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             return `🔧 调用工具中…\n\`\`\`\n${toolBlock}\n\`\`\``;
           };
 
-          const timeoutPromise = new Promise<void>((_, reject) => {
+          // 绝对超时保护：无论 hasResponse 状态如何都会触发
+          // 修复：之前 hasResponse=true 时不 reject，导致 dispatchPromise 永久挂起时
+          // Promise.race 也永远不 resolve，进而 activeUsers 永不清理
+          const ABSOLUTE_TIMEOUT = responseTimeout + 60000; // 绝对超时 = 响应超时 + 60s 缓冲
+          const timeoutPromise = new Promise<void>((resolve, reject) => {
             timeoutId = setTimeout(() => {
               if (!hasResponse) {
                 reject(new Error("Response timeout"));
+              } else {
+                // hasResponse=true 但 dispatch 仍未完成 → 用绝对超时兜底
+                log?.error(`[qqbot:${account.accountId}] ⚠️ Response received but dispatch still pending, will force-resolve after absolute timeout`);
+                resolve(); // resolve 而不是 reject，避免触发错误处理流程
               }
             }, responseTimeout);
+          });
+          // 绝对超时兜底：即使正常 timeout 被跳过（hasResponse=true 且 dispatch 正常完成），
+          // 也确保不会永久挂起
+          const absoluteTimeoutPromise = new Promise<void>((resolve) => {
+            setTimeout(() => {
+              log?.error(`[qqbot:${account.accountId}] ⚠️ Absolute timeout (${ABSOLUTE_TIMEOUT}ms) reached, force-resolving dispatch wait`);
+              resolve();
+            }, ABSOLUTE_TIMEOUT);
           });
 
           // ============ 消息发送目标 ============
@@ -1521,6 +1596,8 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           let streamEnded = false; // 流式是否已结束
           let streamFailed = false; // 流式是否失败（停止当前消息发送）
           let sendingLock = false; // 发送锁，防止并发发送
+          const SENDING_LOCK_TIMEOUT = 15000; // sendingLock 一般等待超时（15秒）
+          const CHAIN_LOCK_TIMEOUT = 3 * 60 * 1000; // 责任链处理 sendingLock 等待超时（3分钟，可能涉及多文件上传）
           let pendingPayloadText = ""; // 暂存 QQBOT_PAYLOAD 结构化载荷全文（流式结束后处理）
           let keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
           const MAX_KEEPALIVE_COUNT = 10; // 最大连续空保活次数，超过后只能通过发送实际消息来续
@@ -1624,7 +1701,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
            * 用于在流式中需要发送富媒体消息前中断流式
            */
           const interruptStream = async () => {
+            const lockStart = Date.now();
             while (sendingLock) {
+              if (Date.now() - lockStart > SENDING_LOCK_TIMEOUT) {
+                log?.error(`[qqbot:${account.accountId}] ⚠️ interruptStream: sendingLock wait timeout, forcing`);
+                break;
+              }
               await new Promise(resolve => setTimeout(resolve, 50));
             }
             sendingLock = true;
@@ -1673,7 +1755,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             
             if (supportsStream && streamSender && !streamFailed) {
               // 流式发送：加入 buffer，按安全点发送
+              const lockStart = Date.now();
               while (sendingLock) {
+                if (Date.now() - lockStart > SENDING_LOCK_TIMEOUT) {
+                  log?.error(`[qqbot:${account.accountId}] ⚠️ streamSendTextOrFallback: sendingLock wait timeout, forcing`);
+                  break;
+                }
                 await new Promise(resolve => setTimeout(resolve, 50));
               }
               sendingLock = true;
@@ -1798,7 +1885,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             if (!streamBuffer) return pendingMedia;
 
             // 1. 通过责任链处理完整的媒体标签
+            const lockStart = Date.now();
             while (sendingLock) {
+              if (Date.now() - lockStart > CHAIN_LOCK_TIMEOUT) {
+                log?.error(`[qqbot:${account.accountId}] ⚠️ flushStreamBufferSafe: sendingLock wait timeout (${CHAIN_LOCK_TIMEOUT}ms), forcing`);
+                break;
+              }
               await new Promise(resolve => setTimeout(resolve, 50));
             }
             sendingLock = true;
@@ -1902,7 +1994,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             streamBuffer += delta;
 
             // 获取发送锁
+            const lockStart = Date.now();
             while (sendingLock) {
+              if (Date.now() - lockStart > CHAIN_LOCK_TIMEOUT) {
+                log?.error(`[qqbot:${account.accountId}] ⚠️ handlePartialReply: sendingLock wait timeout (${CHAIN_LOCK_TIMEOUT}ms), forcing`);
+                break;
+              }
               await new Promise(resolve => setTimeout(resolve, 50));
             }
             sendingLock = true;
@@ -2467,7 +2564,12 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                 if (streamStarted && !streamEnded && streamSender) {
                   const ctx = streamSender.getContext();
                   log?.info(`[qqbot:${account.accountId}] 🔀 onAssistantMessageStart: ending current stream for new message, sender=${streamSender.instanceId}, streamId=${ctx.streamId}, index=${ctx.index}`);
+                  const lockWaitStart = Date.now();
                   while (sendingLock) {
+                    if (Date.now() - lockWaitStart > SENDING_LOCK_TIMEOUT) {
+                      log?.error(`[qqbot:${account.accountId}] ⚠️ onAssistantMessageStart: sendingLock wait timeout (${SENDING_LOCK_TIMEOUT}ms), forcing lock acquisition`);
+                      break;
+                    }
                     await new Promise(resolve => setTimeout(resolve, 50));
                   }
                   sendingLock = true;
@@ -2511,9 +2613,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             },
           });
 
-          // 等待分发完成或超时
+          // 等待分发完成或超时（含绝对超时兜底）
           try {
-            await Promise.race([dispatchPromise, timeoutPromise]);
+            await Promise.race([dispatchPromise, timeoutPromise, absoluteTimeoutPromise]);
             
             // 清理心跳定时器
             clearKeepalive();
