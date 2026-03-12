@@ -1871,6 +1871,9 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
           //
 
           const handlePartialReply = supportsStream ? async (payload: { text?: string }) => {
+            const _prFullText = payload.text ?? "";
+            const _prDelta = _prFullText.slice(partialReplySentLength);
+            debugLog?.(`[qqbot:${account.accountId}] handlePartialReply received: fullLen=${_prFullText.length}, sentLen=${partialReplySentLength}, delta=${JSON.stringify(_prDelta)}`);
             if (!streamSender || streamEnded || streamFailed) {
               if ((streamEnded || streamFailed) && !partialReplySkipLogged) {
                 partialReplySkipLogged = true;
@@ -1894,7 +1897,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 
             // ---- 步骤 1: 攒包 ----
             const delta = fullText.slice(partialReplySentLength);
-            debugLog?.(`[qqbot:${account.accountId}] handlePartialReply: fullLen=${fullText.length}, sentLen=${partialReplySentLength}, delta=${JSON.stringify(delta)}, buffer=${JSON.stringify(streamBuffer)}, fullText=${JSON.stringify(fullText)}`);
+            debugLog?.(`[qqbot:${account.accountId}] handlePartialReply processing: delta=${JSON.stringify(delta)}, buffer=${JSON.stringify(streamBuffer)}`);
             partialReplySentLength = fullText.length;
             streamBuffer += delta;
 
@@ -1904,45 +1907,45 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             }
             sendingLock = true;
             try {
-              // ---- 步骤 2: 责任链主动处理 ----
-              // 处理需要立即响应的特殊格式（QQBOT_PAYLOAD、完整媒体标签）
-              const ctx = buildHandlerContext();
-              const { handled } = await handlerChain.processBuffer(ctx);
-              streamBuffer = ctx.buffer;
+                // ---- 步骤 2: 责任链主动处理 ----
+                // 处理需要立即响应的特殊格式（QQBOT_PAYLOAD、完整媒体标签）
+                const ctx = buildHandlerContext();
+                const { handled } = await handlerChain.processBuffer(ctx);
+                streamBuffer = ctx.buffer;
 
-              // 如果 payload 被拦截（abort），直接返回
-              if (handled && pendingPayloadText) {
-                return;
-              }
+                // 如果 payload 被拦截（abort），直接返回
+                if (handled && pendingPayloadText) {
+                  return;
+                }
 
-              // 如果流式已失败，停止发送
-              if (streamFailed) {
-                streamBuffer = "";
-                return;
-              }
+                // 如果流式已失败，停止发送
+                if (streamFailed) {
+                  streamBuffer = "";
+                  return;
+                }
 
-              // ---- 步骤 3 + 4: 判断能否发送 + 循环发送安全分片 ----
-              while (streamBuffer.length >= STREAM_MIN_FLUSH_CHARS) {
-                const safePoint = handlerChain.findSafeFlushPoint(streamBuffer);
-                if (safePoint <= 0) break; // 无安全点，继续攒
+                // ---- 步骤 3 + 4: 判断能否发送 + 循环发送安全分片 ----
+                while (streamBuffer.length >= STREAM_MIN_FLUSH_CHARS) {
+                  const safePoint = handlerChain.findSafeFlushPoint(streamBuffer);
+                  if (safePoint <= 0) break; // 无安全点，继续攒
 
-                const toSend = streamBuffer.slice(0, safePoint);
-                streamBuffer = streamBuffer.slice(safePoint);
+                  const toSend = streamBuffer.slice(0, safePoint);
+                  streamBuffer = streamBuffer.slice(safePoint);
 
-                if (toSend) {
-                  const success = await sendStreamChunk(toSend, false);
-                  if (success) {
-                    streamStarted = true;
-                  } else {
-                    // 流式发送失败，停止当前消息发送
-                    streamFailed = true;
-                    clearKeepalive(); // 立即停止保活，防止继续发送空分片
-                    log?.error(`[qqbot:${account.accountId}] ❌ Stream send failed in onPartialReply: sender=${streamSender?.instanceId}, streamId=${streamSender?.getContext().streamId}, stopping current message`);
-                    streamBuffer = "";
-                    return;
+                  if (toSend) {
+                    const success = await sendStreamChunk(toSend, false);
+                    if (success) {
+                      streamStarted = true;
+                    } else {
+                      // 流式发送失败，停止当前消息发送
+                      streamFailed = true;
+                      clearKeepalive(); // 立即停止保活，防止继续发送空分片
+                      log?.error(`[qqbot:${account.accountId}] ❌ Stream send failed in onPartialReply: sender=${streamSender?.instanceId}, streamId=${streamSender?.getContext().streamId}, stopping current message`);
+                      streamBuffer = "";
+                      return;
+                    }
                   }
                 }
-              }
             } finally {
               sendingLock = false;
             }
@@ -1957,6 +1960,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
                 hasResponse = true;
 
                 log?.info(`[qqbot:${account.accountId}] deliver called, kind: ${info.kind}, payload keys: ${Object.keys(payload).join(", ")}`);
+                debugLog?.(`[qqbot:${account.accountId}] deliver content: kind=${info.kind}, text=${JSON.stringify((payload.text ?? "").slice(0, 500))}${(payload.text ?? "").length > 500 ? `...(total ${payload.text!.length} chars)` : ""}, mediaUrls=${JSON.stringify(payload.mediaUrls ?? [])}, mediaUrl=${payload.mediaUrl ?? "none"}`);
 
                 // ============ 跳过工具调用的中间结果（带兜底保护） ============
                 if (info.kind === "tool") {
@@ -2513,6 +2517,24 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             
             // 清理心跳定时器
             clearKeepalive();
+
+            // ============ 等待后台 handlePartialReply 完成 ============
+            // onPartialReply 是 fire-and-forget（void 调用），dispatch 完成时可能还有
+            // handlePartialReply 在后台执行（如富媒体发送等耗时操作）。
+            // 等待 sendingLock 释放以确保后台操作完成
+            if (sendingLock) {
+              log?.info(`[qqbot:${account.accountId}] Waiting for sendingLock to release...`);
+              const waitStart = Date.now();
+              const LOCK_WAIT_TIMEOUT = 30000; // 最多等 30 秒
+              while (sendingLock && Date.now() - waitStart < LOCK_WAIT_TIMEOUT) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+              }
+              if (sendingLock) {
+                log?.error(`[qqbot:${account.accountId}] ⚠️ Timed out waiting for sendingLock, proceeding with stream end`);
+              } else {
+                log?.info(`[qqbot:${account.accountId}] sendingLock released (${Date.now() - waitStart}ms)`);
+              }
+            }
             
             // ============ 流式结束：处理暂存的 QQBOT_PAYLOAD ============
             // 如果 onPartialReply 检测到 QQBOT_PAYLOAD 前缀并暂存了全文，在此统一处理
@@ -2572,6 +2594,17 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
             clearKeepalive();
             if (timeoutId) {
               clearTimeout(timeoutId);
+            }
+            // 等待后台 handlePartialReply 完成（超时场景同样需要）
+            if (sendingLock) {
+              log?.info(`[qqbot:${account.accountId}] [timeout] Waiting for sendingLock to release...`);
+              const waitStart = Date.now();
+              while (sendingLock && Date.now() - waitStart < 10000) { // 超时场景等待更短（10s）
+                await new Promise(resolve => setTimeout(resolve, 100));
+              }
+              if (sendingLock) {
+                log?.error(`[qqbot:${account.accountId}] ⚠️ [timeout] Gave up waiting for sendingLock`);
+              }
             }
             // 流式结束处理（超时场景）
             // 同正常完成场景：streamStarted=false 但 buffer 非空时也需要处理

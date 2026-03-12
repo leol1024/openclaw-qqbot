@@ -14,6 +14,7 @@ INSTALL_SRC=""
 APPID=""
 SECRET=""
 STREAM=""
+DEBUG=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -33,6 +34,7 @@ print_usage() {
     echo "  upgrade-via-npm.sh --version <版本号>            # 升级到指定版本"
     echo "  upgrade-via-npm.sh --appid <appid> --secret <secret>  # 配置通道并启动"
     echo "  upgrade-via-npm.sh --stream <yes|no>              # 是否启用流式消息（仅C2C私聊生效）"
+    echo "  upgrade-via-npm.sh --debug <yes|no>               # 是否启用 debug 模式"
     if [ -n "$LOCAL_VERSION" ]; then
         echo "  upgrade-via-npm.sh --self-version               # 升级到当前仓库版本（$LOCAL_VERSION）"
     else
@@ -43,6 +45,7 @@ print_usage() {
     echo "  QQBOT_APPID           QQ机器人 appid"
     echo "  QQBOT_SECRET          QQ机器人 secret"
     echo "  QQBOT_STREAM          是否启用流式消息（yes/no）"
+    echo "  QQBOT_DEBUG           是否启用 debug 模式（yes/no）"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -77,6 +80,11 @@ while [[ $# -gt 0 ]]; do
             STREAM="$2"
             shift 2
             ;;
+        --debug)
+            [ -z "$2" ] && echo "❌ --debug 需要参数" && exit 1
+            DEBUG="$2"
+            shift 2
+            ;;
         -h|--help)
             print_usage
             exit 0
@@ -90,6 +98,7 @@ INSTALL_SRC="${INSTALL_SRC:-${PKG_NAME}@latest}"
 APPID="${APPID:-$QQBOT_APPID}"
 SECRET="${SECRET:-$QQBOT_SECRET}"
 STREAM="${STREAM:-$QQBOT_STREAM}"
+DEBUG="${DEBUG:-$QQBOT_DEBUG}"
 
 # 检测 CLI
 CMD=""
@@ -247,6 +256,60 @@ if [ -n "$STREAM" ]; then
             echo "  ✅ stream 配置成功（直接编辑配置文件）"
         else
             echo "  ⚠️  stream 配置设置失败，不影响后续运行"
+        fi
+    fi
+fi
+
+# 配置 debug 选项（仅在明确指定时才配置）
+if [ -n "$DEBUG" ]; then
+    echo ""
+    echo "配置 debug 选项..."
+    if [ "$DEBUG" = "yes" ] || [ "$DEBUG" = "y" ] || [ "$DEBUG" = "true" ]; then
+        DEBUG_VALUE="true"
+        echo "启用 debug 模式..."
+    else
+        DEBUG_VALUE="false"
+        echo "禁用 debug 模式..."
+    fi
+
+    CURRENT_DEBUG_VALUE=$(node -e "
+      const fs = require('fs');
+      const path = require('path');
+      const home = process.env.HOME;
+      for (const app of ['openclaw', 'clawdbot', 'moltbot']) {
+        const f = path.join(home, '.' + app, app + '.json');
+        if (!fs.existsSync(f)) continue;
+        try {
+          const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+          const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
+          for (const key of keys) {
+            const ch = cfg.channels && cfg.channels[key];
+            if (!ch) continue;
+            if (typeof ch.debug === 'boolean') { process.stdout.write(String(ch.debug)); process.exit(0); }
+          }
+        } catch {}
+      }
+    " 2>/dev/null || true)
+
+    if [ "$CURRENT_DEBUG_VALUE" = "$DEBUG_VALUE" ]; then
+        echo "  ✅ debug 配置已是目标值，跳过写入"
+    elif $CMD config set channels.qqbot.debug "$DEBUG_VALUE" 2>&1; then
+        echo "  ✅ debug 配置成功"
+    else
+        echo "  ⚠️  $CMD config set 失败，尝试直接编辑配置文件..."
+        if [ -f "$APP_CONFIG" ] && node -e "
+          const fs = require('fs');
+          const cfg = JSON.parse(fs.readFileSync('$APP_CONFIG', 'utf-8'));
+          if (!cfg.channels) cfg.channels = {};
+          if (!cfg.channels.qqbot) cfg.channels.qqbot = {};
+          const target = $DEBUG_VALUE;
+          if (cfg.channels.qqbot.debug === target) process.exit(0);
+          cfg.channels.qqbot.debug = target;
+          fs.writeFileSync('$APP_CONFIG', JSON.stringify(cfg, null, 4) + '\n');
+        " 2>&1; then
+            echo "  ✅ debug 配置成功（直接编辑配置文件）"
+        else
+            echo "  ⚠️  debug 配置设置失败，不影响后续运行"
         fi
     fi
 fi

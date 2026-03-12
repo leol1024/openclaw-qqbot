@@ -83,6 +83,7 @@ export function resolveQQBotAccount(
       imageServerBaseUrl: qqbot?.imageServerBaseUrl,
       markdownSupport: qqbot?.markdownSupport ?? true,
       streamSupport: qqbot?.streamSupport,
+      debug: qqbot?.debug,
     };
     appId = normalizeAppId(qqbot?.appId);
   } else {

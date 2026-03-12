@@ -104,7 +104,11 @@ export class MediaTagHandler implements StreamHandler {
           } else if (isLocalPath) {
             // 本地图片 → 中断流式 → 富媒体 API → 重建
             await ctx.interruptStream();
-            await ctx.sendMediaByType("image", mediaPath);
+            try {
+              await ctx.sendMediaByType("image", mediaPath);
+            } catch (err) {
+              ctx.log?.error(`[qqbot:${ctx.accountId}] [MediaTagHandler] image send failed (caught in handler): ${err}`);
+            }
             ctx.rebuildStream();
           } else {
             ctx.log?.error(`[qqbot:${ctx.accountId}] [MediaTagHandler] Invalid image path: ${imagePath}`);
@@ -113,7 +117,11 @@ export class MediaTagHandler implements StreamHandler {
           // 语音/视频/文件 → 中断流式 → 发送 → 重建
           ctx.log?.info(`[qqbot:${ctx.accountId}] [MediaTagHandler] ${mediaType} tag, interrupting stream`);
           await ctx.interruptStream();
-          await ctx.sendMediaByType(mediaType, mediaPath);
+          try {
+            await ctx.sendMediaByType(mediaType, mediaPath);
+          } catch (err) {
+            ctx.log?.error(`[qqbot:${ctx.accountId}] [MediaTagHandler] ${mediaType} send failed (caught in handler): ${err}`);
+          }
           ctx.rebuildStream();
         }
       }

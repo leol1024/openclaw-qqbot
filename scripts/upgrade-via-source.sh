@@ -26,6 +26,7 @@ APPID=""
 SECRET=""
 MARKDOWN=""
 STREAM=""
+DEBUG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -45,6 +46,10 @@ while [[ $# -gt 0 ]]; do
             STREAM="$2"
             shift 2
             ;;
+        --debug)
+            DEBUG="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "用法: $0 [选项]"
             echo ""
@@ -53,6 +58,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --secret <secret>     QQ机器人 secret"
             echo "  --markdown <yes|no>   是否启用 markdown 消息格式（默认: no）"
             echo "  --stream <yes|no>     是否启用流式消息（仅C2C私聊生效，默认: no）"
+            echo "  --debug <yes|no>      是否启用 debug 模式（默认: no）"
             echo "  -h, --help            显示帮助信息"
             echo ""
             echo "也可以通过环境变量设置:"
@@ -61,6 +67,7 @@ while [[ $# -gt 0 ]]; do
             echo "  QQBOT_TOKEN           QQ机器人 token (appid:secret)"
             echo "  QQBOT_MARKDOWN        是否启用 markdown（yes/no）"
             echo "  QQBOT_STREAM          是否启用流式消息（yes/no）"
+            echo "  QQBOT_DEBUG           是否启用 debug 模式（yes/no）"
             echo ""
             echo "不带参数时，将使用已有配置直接启动。"
             echo ""
@@ -80,6 +87,7 @@ APPID="${APPID:-$QQBOT_APPID}"
 SECRET="${SECRET:-$QQBOT_SECRET}"
 MARKDOWN="${MARKDOWN:-$QQBOT_MARKDOWN}"
 STREAM="${STREAM:-$QQBOT_STREAM}"
+DEBUG="${DEBUG:-$QQBOT_DEBUG}"
 
 echo "========================================="
 echo "  qqbot 一键更新启动脚本"
@@ -87,9 +95,10 @@ echo "========================================="
 
 # 1. 备份已有 qqbot 通道配置，防止升级过程丢失
 echo ""
-echo "[1/7] 备份已有配置..."
+echo "[1/8] 备份已有配置..."
 SAVED_QQBOT_TOKEN=""
 SAVED_STREAM_SUPPORT=""
+SAVED_DEBUG=""
 for APP_NAME in openclaw clawdbot moltbot; do
     CONFIG_FILE="$HOME/.$APP_NAME/$APP_NAME.json"
     if [ -f "$CONFIG_FILE" ]; then
@@ -116,9 +125,22 @@ for APP_NAME in openclaw clawdbot moltbot; do
                 }
             " 2>/dev/null || true)
         fi
+        # 同时备份 debug 配置
+        if [ -z "$SAVED_DEBUG" ]; then
+            SAVED_DEBUG=$(node -e "
+                const cfg = JSON.parse(require('fs').readFileSync('$CONFIG_FILE', 'utf8'));
+                const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
+                for (const key of keys) {
+                    const ch = cfg.channels && cfg.channels[key];
+                    if (!ch) continue;
+                    if (typeof ch.debug === 'boolean') { process.stdout.write(String(ch.debug)); process.exit(0); }
+                }
+            " 2>/dev/null || true)
+        fi
         if [ -n "$SAVED_QQBOT_TOKEN" ]; then
             echo "已备份 qqbot 通道 token: ${SAVED_QQBOT_TOKEN:0:10}..."
             [ -n "$SAVED_STREAM_SUPPORT" ] && echo "已备份 streamSupport: $SAVED_STREAM_SUPPORT"
+            [ -n "$SAVED_DEBUG" ] && echo "已备份 debug: $SAVED_DEBUG"
             break
         fi
     fi
@@ -179,11 +201,39 @@ if [ -z "$SAVED_QQBOT_TOKEN" ] && [ -d "$HOME/.openclaw" ]; then
             echo "已从 ~/.openclaw/openclaw.json.bak* 找到 streamSupport 备份: $SAVED_STREAM_SUPPORT"
         fi
     fi
+
+    # 同时从备份文件中恢复 debug
+    if [ -z "$SAVED_DEBUG" ]; then
+        SAVED_DEBUG=$(node -e "
+          const fs = require('fs');
+          const path = require('path');
+          const dir = path.join(process.env.HOME, '.openclaw');
+          const files = fs.readdirSync(dir)
+            .filter((n) => /^openclaw\.json\.bak(\.\d+)?$/.test(n))
+            .map((n) => path.join(dir, n))
+            .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          for (const f of files) {
+            try {
+              const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+              const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
+              for (const key of keys) {
+                const ch = cfg.channels && cfg.channels[key];
+                if (!ch) continue;
+                if (typeof ch.debug === 'boolean') { process.stdout.write(String(ch.debug)); process.exit(0); }
+              }
+            } catch {}
+          }
+        " 2>/dev/null || true)
+
+        if [ -n "$SAVED_DEBUG" ]; then
+            echo "已从 ~/.openclaw/openclaw.json.bak* 找到 debug 备份: $SAVED_DEBUG"
+        fi
+    fi
 fi
 
 # 2. 移除老版本
 echo ""
-echo "[2/7] 移除老版本..."
+echo "[2/8] 移除老版本..."
 if [ -f "$PROJ_DIR/scripts/cleanup-legacy-plugins.sh" ]; then
     bash "$PROJ_DIR/scripts/cleanup-legacy-plugins.sh"
 else
@@ -192,7 +242,7 @@ fi
 
 # 3. 安装当前版本
 echo ""
-echo "[3/7] 安装当前版本（源码安装）..."
+echo "[3/8] 安装当前版本（源码安装）..."
 
 echo "检查当前目录: $(pwd)"
 echo "检查openclaw版本: $(openclaw --version 2>/dev/null || echo 'openclaw not found')"
@@ -323,7 +373,7 @@ fi
 
 # 4. 配置机器人通道（仅在需要变更时写入配置，避免无意义覆盖）
 echo ""
-echo "[4/7] 配置机器人通道..."
+echo "[4/8] 配置机器人通道..."
 
 # 读取当前 qqbot token（兼容多 key）
 CURRENT_QQBOT_TOKEN=""
@@ -401,7 +451,7 @@ fi
 
 # 5. 配置 markdown 选项（仅在明确指定时才配置）
 echo ""
-echo "[5/7] 配置 markdown 选项..."
+echo "[5/8] 配置 markdown 选项..."
 
 if [ -n "$MARKDOWN" ]; then
     # 设置 markdown 配置
@@ -462,7 +512,7 @@ fi
 
 # 6. 配置 stream 选项（优先命令行参数，其次自动恢复备份值）
 echo ""
-echo "[6/7] 配置 stream 选项..."
+echo "[6/8] 配置 stream 选项..."
 
 # 如果命令行未指定 --stream，但备份中有 streamSupport 值，则自动恢复
 if [ -z "$STREAM" ] && [ "$SAVED_STREAM_SUPPORT" = "true" ]; then
@@ -557,9 +607,79 @@ else
     echo "未指定 stream 选项，使用已有配置"
 fi
 
-# 7. 启动 openclaw
+# 7. 配置 debug 选项（优先命令行参数，其次自动恢复备份值）
 echo ""
-echo "[7/7] 启动 openclaw..."
+echo "[7/8] 配置 debug 选项..."
+
+# 如果命令行未指定 --debug，但备份中有 debug 值，则自动恢复
+if [ -z "$DEBUG" ] && [ "$SAVED_DEBUG" = "true" ]; then
+    DEBUG="yes"
+    echo "自动恢复备份的 debug=true 配置..."
+elif [ -z "$DEBUG" ] && [ "$SAVED_DEBUG" = "false" ]; then
+    DEBUG="no"
+    echo "自动恢复备份的 debug=false 配置..."
+fi
+
+if [ -n "$DEBUG" ]; then
+    # 设置 debug 配置
+    if [ "$DEBUG" = "yes" ] || [ "$DEBUG" = "y" ] || [ "$DEBUG" = "true" ]; then
+        DEBUG_VALUE="true"
+        echo "启用 debug 模式..."
+    else
+        DEBUG_VALUE="false"
+        echo "禁用 debug 模式..."
+    fi
+
+    CURRENT_DEBUG_VALUE=$(node -e "
+      const fs = require('fs');
+      const path = require('path');
+      const home = process.env.HOME;
+      for (const app of ['openclaw', 'clawdbot', 'moltbot']) {
+        const f = path.join(home, '.' + app, app + '.json');
+        if (!fs.existsSync(f)) continue;
+        try {
+          const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+          const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
+          for (const key of keys) {
+            const ch = cfg.channels && cfg.channels[key];
+            if (!ch) continue;
+            if (typeof ch.debug === 'boolean') { process.stdout.write(String(ch.debug)); process.exit(0); }
+          }
+        } catch {}
+      }
+    " 2>/dev/null || true)
+
+    if [ "$CURRENT_DEBUG_VALUE" = "$DEBUG_VALUE" ]; then
+        echo "✅ debug 配置已是目标值，跳过写入（避免配置覆盖提示）"
+    elif openclaw config set channels.qqbot.debug "$DEBUG_VALUE" 2>&1; then
+        echo "✅ debug配置成功"
+        _config_changed=1
+    else
+        echo "⚠️  openclaw config set 失败，尝试直接编辑配置文件..."
+        OPENCLAW_CONFIG="$HOME/.openclaw/openclaw.json"
+        if [ -f "$OPENCLAW_CONFIG" ] && node -e "
+          const fs = require('fs');
+          const cfg = JSON.parse(fs.readFileSync('$OPENCLAW_CONFIG', 'utf-8'));
+          if (!cfg.channels) cfg.channels = {};
+          if (!cfg.channels.qqbot) cfg.channels.qqbot = {};
+          const target = $DEBUG_VALUE;
+          if (cfg.channels.qqbot.debug === target) process.exit(0);
+          cfg.channels.qqbot.debug = target;
+          fs.writeFileSync('$OPENCLAW_CONFIG', JSON.stringify(cfg, null, 4) + '\n');
+        " 2>&1; then
+            echo "✅ debug配置成功（直接编辑配置文件）"
+            _config_changed=1
+        else
+            echo "⚠️  debug配置设置失败，不影响后续运行"
+        fi
+    fi
+else
+    echo "未指定 debug 选项，使用已有配置"
+fi
+
+# 8. 启动 openclaw
+echo ""
+echo "[8/8] 启动 openclaw..."
 echo "========================================="
 
 # 检查openclaw是否可用
