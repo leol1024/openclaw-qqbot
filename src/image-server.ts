@@ -418,51 +418,116 @@ export async function ensureImageServer(publicBaseUrl?: string): Promise<string 
  * @param url 远程文件 URL
  * @param destDir 目标目录
  * @param originalFilename 原始文件名（可选，完整文件名包含扩展名）
+ * @param options 下载选项
  * @returns 本地文件路径，失败返回 null
  */
 export async function downloadFile(
   url: string,
   destDir: string,
-  originalFilename?: string
+  originalFilename?: string,
+  options?: {
+    /** 超时时间（毫秒），默认 120000（2分钟） */
+    timeoutMs?: number;
+    /** 最大文件大小（字节），默认 50MB */
+    maxSizeBytes?: number;
+  },
 ): Promise<string | null> {
+  const timeoutMs = options?.timeoutMs ?? 120000;
+  const maxSizeBytes = options?.maxSizeBytes ?? 50 * 1024 * 1024;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     // 确保目录存在
     if (!fs.existsSync(destDir)) {
       fs.mkdirSync(destDir, { recursive: true });
     }
 
-    // 下载文件
-    const response = await fetch(url);
+    // 下载文件（带超时控制）
+    const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
       console.error(`[image-server] Download failed: ${response.status} ${response.statusText}`);
       return null;
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer());
+    // Content-Length 预检
+    const contentLength = response.headers.get("content-length");
+    if (contentLength) {
+      const declaredSize = parseInt(contentLength, 10);
+      if (declaredSize > maxSizeBytes) {
+        console.error(`[image-server] Download rejected: Content-Length ${declaredSize} exceeds limit ${maxSizeBytes}`);
+        return null;
+      }
+    }
+
+    // 流式下载，实时监控大小
+    const reader = response.body?.getReader();
+    if (!reader) {
+      console.error(`[image-server] Download failed: no response body`);
+      return null;
+    }
+
+    const chunks: Uint8Array[] = [];
+    let totalSize = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalSize += value.byteLength;
+      if (totalSize > maxSizeBytes) {
+        reader.cancel();
+        console.error(`[image-server] Download aborted: size ${totalSize} exceeds limit ${maxSizeBytes}`);
+        return null;
+      }
+      chunks.push(value);
+    }
+
+    const buffer = Buffer.concat(chunks);
+
+    // 从 Content-Disposition 解析文件名（如果没有提供 originalFilename）
+    if (!originalFilename) {
+      const disposition = response.headers.get("content-disposition");
+      if (disposition) {
+        const filenameMatch = disposition.match(/filename\*?=(?:UTF-8''|")?([^";]+)"?/i);
+        if (filenameMatch?.[1]) {
+          try { originalFilename = decodeURIComponent(filenameMatch[1]); } catch { /* keep undefined */ }
+        }
+      }
+    }
     
     // 确定文件名
     let finalFilename: string;
     if (originalFilename) {
-      // 使用原始文件名，但添加时间戳避免冲突
-      const ext = path.extname(originalFilename);
-      const baseName = path.basename(originalFilename, ext);
+      let decodedFilename = originalFilename;
+      try { decodedFilename = decodeURIComponent(originalFilename); } catch { /* keep original */ }
+      const ext = path.extname(decodedFilename);
+      const baseName = path.basename(decodedFilename, ext);
       const timestamp = Date.now();
       finalFilename = `${baseName}_${timestamp}${ext}`;
     } else {
-      // 没有原始文件名，生成随机名
-      finalFilename = `${generateImageId()}.bin`;
+      // 没有原始文件名，尝试从 Content-Type 推导扩展名
+      const contentType = response.headers.get("content-type");
+      const ext = contentType ? (getExtFromMime(contentType.split(";")[0]?.trim() ?? "") ?? "bin") : "bin";
+      finalFilename = `${generateImageId()}.${ext}`;
     }
     
     const filePath = path.join(destDir, finalFilename);
 
     // 保存文件
     fs.writeFileSync(filePath, buffer);
-    console.log(`[image-server] Downloaded file: ${filePath}`);
+    console.log(`[image-server] Downloaded file: ${filePath} (${buffer.length} bytes, ${Date.now()}ms)`);
     
     return filePath;
   } catch (err) {
-    console.error(`[image-server] Download error:`, err);
+    if (err instanceof Error && err.name === "AbortError") {
+      console.error(`[image-server] Download timeout after ${timeoutMs}ms: ${url}`);
+    } else {
+      console.error(`[image-server] Download error:`, err);
+    }
     return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

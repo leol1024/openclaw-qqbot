@@ -1,11 +1,12 @@
 {
-  "name": "qqbot",
-  "version": "1.5.5",
+  "name": "@tencent-connect/openclaw-qqbot",
+  "version": "1.6.3",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "openclaw-qqbot": "./bin/qqbot-cli.js"
+    "openclaw-qqbot": "./bin/qqbot-cli.js",
+    "qqbot": "./bin/qqbot-cli.js"
   },
   "files": [
     "dist",
@@ -20,19 +21,19 @@
     "moltbot.plugin.json"
   ],
   "clawdbot": {
-    "id": "qqbot",
+    "id": "openclaw-qqbot",
     "extensions": [
       "./index.ts"
     ]
   },
   "moltbot": {
-    "id": "qqbot",
+    "id": "openclaw-qqbot",
     "extensions": [
       "./index.ts"
     ]
   },
   "openclaw": {
-    "id": "qqbot",
+    "id": "openclaw-qqbot",
     "extensions": [
       "./index.ts"
     ]

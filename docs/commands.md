@@ -1,4 +1,4 @@
-# OpenClaw 常用指令手册
+# openclaw 常用指令手册
 
 本文档整理了 `openclaw` 的常用命令，方便日常使用和维护。
 
@@ -33,16 +33,16 @@ openclaw plugins list
 
 ## 📺 通道管理
 
-### 配置 QQBot 通道
+### 配置 qqbot 通道
 ```bash
-# QQBot 是自定义插件，通过 config set 配置（不是 channels add）
-openclaw config set channels.qqbot.appId "你的AppID"
-openclaw config set channels.qqbot.clientSecret "你的AppSecret"
+# qqbot 是自定义插件，通过 config set 配置（不是 channels add）
+openclaw config set channels.qqbot.appId "你的appid"
+openclaw config set channels.qqbot.clientSecret "你的appsecret"
 openclaw config set channels.qqbot.enabled true
 ```
 
 > **注意**：`openclaw channels add --channel` 仅支持内置通道（telegram、discord 等）。
-> QQBot 作为自定义插件，需通过 `config set` 或直接编辑 `~/.openclaw/openclaw.json` 配置。
+> qqbot 作为自定义插件，需通过 `config set` 或直接编辑 `~/.openclaw/openclaw.json` 配置。
 
 ### 禁用通道
 ```bash
@@ -111,10 +111,10 @@ openclaw logs --plain
 
 ### 设置配置项
 ```bash
-# 启用 Markdown 消息格式
+# 启用 markdown 消息格式
 openclaw config set channels.qqbot.markdownSupport true
 
-# 禁用 Markdown 消息格式
+# 禁用 markdown 消息格式
 openclaw config set channels.qqbot.markdownSupport false
 ```
 
@@ -138,16 +138,16 @@ openclaw config
 ### 一键升级并启动
 ```bash
 # 基本用法
-./scripts/upgrade-and-run.sh
+./scripts/upgrade-via-source.sh
 
-# 指定 AppID 和 Secret
-./scripts/upgrade-and-run.sh --appid 123456789 --secret your_secret
+# 指定 appid 和 secret
+./scripts/upgrade-via-source.sh --appid 123456789 --secret your_secret
 
-# 同时启用 Markdown
-./scripts/upgrade-and-run.sh --appid 123456789 --secret your_secret --markdown yes
+# 同时启用 markdown
+./scripts/upgrade-via-source.sh --appid 123456789 --secret your_secret --markdown yes
 
 # 查看帮助
-./scripts/upgrade-and-run.sh --help
+./scripts/upgrade-via-source.sh --help
 ```
 
 **环境变量方式：**
@@ -155,15 +155,15 @@ openclaw config
 export QQBOT_APPID="123456789"
 export QQBOT_SECRET="your_secret"
 export QQBOT_MARKDOWN="no"
-./scripts/upgrade-and-run.sh
+./scripts/upgrade-via-source.sh
 ```
 
-### Markdown 设置脚本
+### markdown 设置脚本
 ```bash
-# 启用 Markdown
+# 启用 markdown
 ./scripts/set-markdown.sh enable
 
-# 禁用 Markdown
+# 禁用 markdown
 ./scripts/set-markdown.sh disable
 
 # 查看当前状态
@@ -176,7 +176,7 @@ export QQBOT_MARKDOWN="no"
 ### 升级脚本（清理旧版本）
 ```bash
 # 清理旧版本插件和配置
-bash ./scripts/upgrade.sh
+bash ./scripts/cleanup-legacy-plugins.sh
 ```
 
 ---
@@ -185,10 +185,10 @@ bash ./scripts/upgrade.sh
 
 | 路径 | 说明 |
 |------|------|
-| `~/.openclaw/` | OpenClaw 主目录 |
+| `~/.openclaw/` | openclaw 主目录 |
 | `~/.openclaw/openclaw.json` | 全局配置文件 |
 | `~/.openclaw/extensions/` | 插件安装目录 |
-| `~/.openclaw/extensions/qqbot/` | QQBot 插件目录 |
+| `~/.openclaw/extensions/qqbot/` | qqbot 插件目录 |
 
 ---
 
@@ -212,14 +212,14 @@ openclaw channels list
 ### 重新安装插件
 ```bash
 # 1. 清理旧版本
-bash ./scripts/upgrade.sh
+bash ./scripts/cleanup-legacy-plugins.sh
 
 # 2. 重新安装
 openclaw plugins install .
 
 # 3. 重新配置通道
-openclaw config set channels.qqbot.appId "你的AppID"
-openclaw config set channels.qqbot.clientSecret "你的AppSecret"
+openclaw config set channels.qqbot.appId "你的appid"
+openclaw config set channels.qqbot.clientSecret "你的appsecret"
 openclaw config set channels.qqbot.enabled true
 ```
 
@@ -228,7 +228,7 @@ openclaw config set channels.qqbot.enabled true
 ## ⚠️ 注意事项
 
 1. **不要使用 sudo 运行脚本**：会导致配置文件权限问题
-2. **Markdown 功能需要权限**：启用前需在 QQ 开放平台申请 Markdown 消息权限
+2. **markdown 功能需要权限**：启用前需在 QQ 开放平台申请 markdown 消息权限
 
 ---
 

@@ -139,9 +139,48 @@ export function formatDuration(durationMs: number): string {
   return remainSeconds > 0 ? `${minutes}分${remainSeconds}秒` : `${minutes}分钟`;
 }
 
-export function isAudioFile(filePath: string): boolean {
+export function isAudioFile(filePath: string, mimeType?: string): boolean {
+  // MIME 优先判断（解决无扩展名或扩展名不匹配的问题）
+  if (mimeType) {
+    if (mimeType === "voice" || mimeType.startsWith("audio/")) return true;
+  }
   const ext = path.extname(filePath).toLowerCase();
   return [".silk", ".slk", ".amr", ".wav", ".mp3", ".ogg", ".opus", ".aac", ".flac", ".m4a", ".wma", ".pcm"].includes(ext);
+}
+
+/** QQ 平台原生支持的语音 MIME 类型（不需要转码） */
+const QQ_NATIVE_VOICE_MIMES = new Set([
+  "audio/silk", "audio/amr", "audio/wav", "audio/wave",
+  "audio/x-wav", "audio/mpeg", "audio/mp3",
+]);
+
+/** QQ 平台原生支持的语音扩展名（不需要转码） */
+const QQ_NATIVE_VOICE_EXTS = new Set([
+  ".silk", ".slk", ".amr", ".wav", ".mp3",
+]);
+
+/**
+ * 判断语音是否需要转码（参考企微 wecom-app 的 shouldTranscodeWecomVoice）
+ * 
+ * QQ Bot API 原生支持 WAV/MP3/SILK 三种格式，其他格式需要先转码。
+ * 使用 MIME + 扩展名双重判断，避免仅靠扩展名导致误判。
+ * 
+ * @param filePath 音频文件路径
+ * @param mimeType 可选的 MIME 类型
+ * @returns true 表示需要转码，false 表示可以直传
+ */
+export function shouldTranscodeVoice(filePath: string, mimeType?: string): boolean {
+  // MIME 优先：如果 MIME 是 QQ 原生支持的格式，不需要转码
+  if (mimeType && QQ_NATIVE_VOICE_MIMES.has(mimeType.toLowerCase())) {
+    return false;
+  }
+  // 扩展名判断
+  const ext = path.extname(filePath).toLowerCase();
+  if (QQ_NATIVE_VOICE_EXTS.has(ext)) {
+    return false;
+  }
+  // 是音频但不是原生格式 → 需要转码
+  return isAudioFile(filePath, mimeType);
 }
 
 // ============ TTS（文字转语音）============
@@ -482,17 +521,32 @@ export async function audioFileToSilkBase64(filePath: string, directUploadFormat
  * 等待文件就绪（轮询直到文件出现且大小稳定）
  * 用于 TTS 生成后等待文件写入完成
  *
+ * 优化策略：
+ * - 文件出现后如果持续 0 字节超过 emptyGiveUpMs（默认 10s），快速失败
+ * - 文件未出现超过 noFileGiveUpMs（默认 15s），快速失败
+ * - 整体超时 timeoutMs 作为最终兜底
+ *
  * @param filePath 文件路径
- * @param timeoutMs 最大等待时间（默认 2 分钟）
+ * @param timeoutMs 最大等待时间（默认 30 秒）
  * @param pollMs 轮询间隔（默认 500ms）
  * @returns 文件大小（字节），超时或文件始终为空返回 0
  */
-export async function waitForFile(filePath: string, timeoutMs: number = 120000, pollMs: number = 500): Promise<number> {
+export async function waitForFile(
+  filePath: string,
+  timeoutMs: number = 30000,
+  pollMs: number = 500,
+): Promise<number> {
   const start = Date.now();
   let lastSize = -1;
   let stableCount = 0;
   let fileExists = false;
+  let fileAppearedAt = 0; // 文件首次出现时间
   let pollCount = 0;
+
+  // 0 字节文件放弃等待阈值：文件出现后持续空文件超过此时间则快速失败
+  const emptyGiveUpMs = 10000;
+  // 文件始终不出现的放弃阈值
+  const noFileGiveUpMs = 15000;
 
   while (Date.now() - start < timeoutMs) {
     pollCount++;
@@ -500,6 +554,7 @@ export async function waitForFile(filePath: string, timeoutMs: number = 120000, 
       const stat = fs.statSync(filePath);
       if (!fileExists) {
         fileExists = true;
+        fileAppearedAt = Date.now();
         console.log(`[audio-convert] waitForFile: file appeared (${stat.size} bytes, after ${Date.now() - start}ms): ${path.basename(filePath)}`);
       }
       if (stat.size > 0) {
@@ -513,9 +568,19 @@ export async function waitForFile(filePath: string, timeoutMs: number = 120000, 
           stableCount = 0;
         }
         lastSize = stat.size;
+      } else {
+        // 文件存在但 0 字节：检查是否已超过空文件等待阈值
+        if (Date.now() - fileAppearedAt > emptyGiveUpMs) {
+          console.error(`[audio-convert] waitForFile: file still empty after ${emptyGiveUpMs}ms, giving up: ${path.basename(filePath)}`);
+          return 0;
+        }
       }
     } catch {
-      // 文件可能还不存在，继续等
+      // 文件不存在：检查是否已超过无文件等待阈值
+      if (!fileExists && Date.now() - start > noFileGiveUpMs) {
+        console.error(`[audio-convert] waitForFile: file never appeared after ${noFileGiveUpMs}ms, giving up: ${path.basename(filePath)}`);
+        return 0;
+      }
     }
     await new Promise((r) => setTimeout(r, pollMs));
   }

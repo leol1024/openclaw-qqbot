@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# QQBot Markdown 配置脚本
-# 用于单独设置是否启用 Markdown 消息格式
+# qqbot markdown 配置脚本
+# 用于单独设置是否启用 markdown 消息格式
 # 直接编辑 JSON 配置文件，避免框架验证拒绝未注册的 channel
 
 set -e
@@ -29,18 +29,18 @@ show_help() {
     echo "用法: $0 [选项]"
     echo ""
     echo "选项:"
-    echo "  enable, on, yes      启用 Markdown 消息格式"
-    echo "  disable, off, no     禁用 Markdown 消息格式（使用纯文本）"
-    echo "  status               显示当前 Markdown 配置状态"
+    echo "  enable, on, yes      启用 markdown 消息格式"
+    echo "  disable, off, no     禁用 markdown 消息格式（使用纯文本）"
+    echo "  status               显示当前 markdown 配置状态"
     echo "  -h, --help           显示帮助信息"
     echo ""
     echo "示例:"
-    echo "  $0 enable            启用 Markdown"
-    echo "  $0 disable           禁用 Markdown"
+    echo "  $0 enable            启用 markdown"
+    echo "  $0 disable           禁用 markdown"
     echo "  $0 status            查看当前状态"
     echo "  $0                   交互式选择"
     echo ""
-    echo "⚠️  注意: 启用 Markdown 需要在 QQ 开放平台申请 Markdown 消息权限"
+    echo "⚠️  注意: 启用 markdown 需要在 QQ 开放平台申请 markdown 消息权限"
     echo "         如果没有权限，消息将无法正常发送！"
 }
 
@@ -57,22 +57,22 @@ set_markdown_value() {
 }
 
 enable_markdown() {
-    echo "✅ 启用 Markdown 消息格式..."
+    echo "✅ 启用 markdown 消息格式..."
     set_markdown_value true
     echo ""
-    echo "Markdown 已启用。"
-    echo "⚠️  请确保您已在 QQ 开放平台申请了 Markdown 消息权限。"
+    echo "markdown 已启用。"
+    echo "⚠️  请确保您已在 QQ 开放平台申请了 markdown 消息权限。"
 }
 
 disable_markdown() {
-    echo "❌ 禁用 Markdown 消息格式（使用纯文本）..."
+    echo "❌ 禁用 markdown 消息格式（使用纯文本）..."
     set_markdown_value false
     echo ""
-    echo "Markdown 已禁用，将使用纯文本格式发送消息。"
+    echo "markdown 已禁用，将使用纯文本格式发送消息。"
 }
 
 show_status() {
-    echo "当前 Markdown 配置状态:"
+    echo "当前 markdown 配置状态:"
     echo "  配置文件: $OPENCLAW_CONFIG"
     echo ""
     current=$(node -e "
@@ -82,7 +82,7 @@ show_status() {
     if [ "$current" = "true" ]; then
         echo "  状态: ✅ 已启用"
         echo ""
-        echo "  ⚠️  请确保您已在 QQ 开放平台申请了 Markdown 消息权限。"
+        echo "  ⚠️  请确保您已在 QQ 开放平台申请了 markdown 消息权限。"
     elif [ "$current" = "false" ]; then
         echo "  状态: ❌ 已禁用（纯文本模式）"
     else
@@ -92,20 +92,20 @@ show_status() {
 
 interactive_select() {
     echo "========================================="
-    echo "  QQBot Markdown 配置"
+    echo "  qqbot markdown 配置"
     echo "========================================="
     echo ""
     show_status
     echo ""
     echo "-----------------------------------------"
     echo ""
-    echo "是否启用 Markdown 消息格式？"
+    echo "是否启用 markdown 消息格式？"
     echo ""
-    echo "⚠️  注意: 启用 Markdown 需要在 QQ 开放平台申请 Markdown 消息权限"
+    echo "⚠️  注意: 启用 markdown 需要在 QQ 开放平台申请 markdown 消息权限"
     echo "         如果没有权限，消息将无法正常发送！"
     echo ""
-    echo "  1) 启用 Markdown"
-    echo "  2) 禁用 Markdown（纯文本）"
+    echo "  1) 启用 markdown"
+    echo "  2) 禁用 markdown（纯文本）"
     echo "  3) 取消"
     echo ""
     read -t 10 -p "请选择 [1-3] (默认: 2): " choice || choice="2"

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * QQBot CLI - 用于升级和管理 QQBot 插件
+ * qqbot CLI - 用于升级和管理 qqbot 插件
  * 
  * 用法:
  *   npx openclaw-qqbot upgrade    # 升级插件
@@ -36,9 +36,9 @@ function detectInstallation() {
 }
 
 // 需要清理的所有可能的插件 ID / 包名（原仓库 + 本仓库 + 框架推断名）
-const PLUGIN_IDS = ['qqbot', 'openclaw-qq', '@sliverp/qqbot', '@tencent-connect/openclaw-qq', 'openclaw-qqbot'];
+const PLUGIN_IDS = ['qqbot', 'openclaw-qq', '@sliverp/qqbot', '@tencent-connect/openclaw-qq', '@tencent-connect/qqbot', '@tencent-connect/openclaw-qqbot', 'openclaw-qqbot'];
 // 可能的扩展目录名
-const EXTENSION_DIR_NAMES = ['qqbot', 'openclaw-qq'];
+const EXTENSION_DIR_NAMES = ['qqbot', 'openclaw-qq', 'openclaw-qqbot'];
 
 // 清理旧版本插件，返回旧的 qqbot 配置
 function cleanupInstallation(appName) {
@@ -96,6 +96,15 @@ function cleanupInstallation(appName) {
           delete config.plugins.installs[id];
           console.log(`  - 已删除 plugins.installs.${id}`);
         }
+
+        // 删除 plugins.allow 中的 <id>
+        if (Array.isArray(config.plugins?.allow)) {
+          const before = config.plugins.allow.length;
+          config.plugins.allow = config.plugins.allow.filter((x) => x !== id);
+          if (config.plugins.allow.length !== before) {
+            console.log(`  - 已删除 plugins.allow.${id}`);
+          }
+        }
       }
 
       writeFileSync(configFile, JSON.stringify(config, null, 2));
@@ -122,7 +131,7 @@ function runCommand(cmd, args = []) {
 
 // 升级命令
 function upgrade() {
-  console.log('=== QQBot 插件升级脚本 ===');
+  console.log('=== qqbot 插件升级脚本 ===');
 
   let foundInstallation = null;
   let savedConfig = null;
@@ -166,7 +175,7 @@ function upgrade() {
     }
   } else {
     console.log('未找到已保存的 qqbot 配置，请手动配置:');
-    console.log(`  ${foundInstallation} channels add --channel qqbot --token "AppID:AppSecret"`);
+    console.log(`  ${foundInstallation} channels add --channel qqbot --token "appid:appsecret"`);
     return;
   }
 
@@ -177,7 +186,7 @@ function upgrade() {
 
 // 安装命令
 function install() {
-  console.log('=== QQBot 插件安装 ===');
+  console.log('=== qqbot 插件安装 ===');
 
   const cmd = detectInstallation();
   if (!cmd) {
@@ -187,17 +196,17 @@ function install() {
   }
 
   console.log(`\n使用 ${cmd} 安装插件...`);
-  runCommand(cmd, ['plugins', 'install', '@tencent-connect/openclaw-qq']);
+  runCommand(cmd, ['plugins', 'install', '@tencent-connect/openclaw-qqbot']);
 
   console.log('\n=== 安装完成 ===');
   console.log('\n请配置机器人通道:');
-  console.log(`  ${cmd} channels add --channel qqbot --token "AppID:AppSecret"`);
+  console.log(`  ${cmd} channels add --channel qqbot --token "appid:appsecret"`);
 }
 
 // 显示帮助
 function showHelp() {
   console.log(`
-QQBot CLI - QQ机器人插件管理工具
+qqbot CLI - QQ机器人插件管理工具
 
 用法:
   npx openclaw-qqbot <命令>

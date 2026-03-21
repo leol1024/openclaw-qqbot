@@ -5,7 +5,7 @@ import { qqbotPlugin } from "./src/channel.js";
 import { setQQBotRuntime } from "./src/runtime.js";
 
 const plugin = {
-  id: "qqbot",
+  id: "openclaw-qqbot",
   name: "QQ Bot",
   description: "QQ Bot channel plugin",
   configSchema: emptyPluginConfigSchema(),
