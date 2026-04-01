@@ -350,7 +350,7 @@ find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name ".qqbot-upgrade-backup-*" -o -name "
 # ============================================================================
 #  参数解析
 # ============================================================================
-PKG_NAME="@tencent-connect/openclaw-qqbot"
+PKG_NAME="@leoqlin/openclaw-qqbot"
 PLUGIN_ID="openclaw-qqbot"
 TARGET_VERSION=""
 APPID=""
