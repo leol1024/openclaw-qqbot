@@ -80,7 +80,7 @@ trap cleanup_on_exit EXIT
 # 清理上次升级可能遗留的备份目录（如上次脚本被 kill 等极端情况）
 find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-upgrade-backup-*" -exec rm -rf {} + 2>/dev/null || true
 
-PKG_NAME="@tencent-connect/openclaw-qqbot"
+PKG_NAME="@leoqlin/openclaw-qqbot"
 PLUGIN_ID="openclaw-qqbot"
 INSTALL_SRC=""
 TARGET_VERSION=""

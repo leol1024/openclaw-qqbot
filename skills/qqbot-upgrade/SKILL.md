@@ -21,13 +21,13 @@ metadata: {"openclaw":{"emoji":"⬆️","requires":{"config":["channels.qqbot"]}
 在 **bash** 环境中执行（需已安装 `curl`，且能访问 GitHub）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tencent-connect/openclaw-qqbot/main/scripts/upgrade-via-npm.sh | bash
+curl -fsSL https://raw.githubusercontent.com/leol1024/openclaw-qqbot/main/scripts/upgrade-via-npm.sh | bash
 ```
 
 说明：
 
 - `-f`：HTTP 错误时失败；`-sS`：静默但保留错误输出；`-L`：跟随重定向
-- 脚本由 [tencent-connect/openclaw-qqbot](https://github.com/tencent-connect/openclaw-qqbot) 仓库 `main` 分支提供，通过 npm 完成升级流程（具体步骤以脚本为准）
+- 脚本由 [leol1024/openclaw-qqbot](https://github.com/leol1024/openclaw-qqbot) 仓库 `feat/stream_skill` 分支提供，通过 npm 完成升级流程（具体步骤以脚本为准）
 
 ---
 
